@@ -1,0 +1,18 @@
+# Dependências instaladas
+/node_modules
+
+# Arquivos gerados pela compilação
+/dist
+/dist-test
+*.tsbuildinfo
+
+# Relatórios de cobertura dos testes
+/coverage
+
+# Variáveis de ambiente locais
+.env
+.env.*
+!.env.example
+
+# Logs
+*.log
