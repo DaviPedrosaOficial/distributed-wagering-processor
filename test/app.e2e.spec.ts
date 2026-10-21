@@ -1,10 +1,11 @@
 import 'reflect-metadata';
-import { afterEach, beforeEach, describe, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 import { Test, TestingModule } from '@nestjs/testing';
 import { INestApplication } from '@nestjs/common';
 import request from 'supertest';
 import { App } from 'supertest/types.js';
 import { AppModule } from './../src/app.module.js';
+import { MikroORM } from '@mikro-orm/core';
 
 describe('AppController (e2e)', () => {
   let app: INestApplication<App>;
@@ -23,6 +24,16 @@ describe('AppController (e2e)', () => {
       .get('/')
       .expect(200)
       .expect('Hello World!');
+  });
+
+  it('deve executar uma consulta no PostgreSQL', async () => {
+    const orm = app.get(MikroORM);
+
+    const result = await orm.em.getConnection().execute(
+      'SELECT 1 AS connected',
+    );
+
+    expect(result).toEqual([{ connected: 1 }]);
   });
 
   afterEach(async () => {
