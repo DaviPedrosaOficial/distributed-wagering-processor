@@ -17,7 +17,11 @@
     "test": "bun run test:build && bun test",
     "test:unit": "bun run test:build && bun test ./dist-test/src",
     "test:e2e": "bun run test:build && bun test ./dist-test/test",
-    "test:cov": "bun run test:build && bun test --coverage"
+    "test:cov": "bun run test:build && bun test --coverage",
+    "db:debug": "bun run --bun mikro-orm debug --config ./src/database/mikro-orm.config.ts",
+    "db:migration:create": "bun run --bun mikro-orm migration:create --config ./src/database/mikro-orm.config.ts",
+    "db:migration:up": "bun run --bun mikro-orm migration:up --config ./src/database/mikro-orm.config.ts",
+    "db:migration:list": "bun run --bun mikro-orm migration:list --config ./src/database/mikro-orm.config.ts"
   },
   "dependencies": {
     "@mikro-orm/core": "7.2",
@@ -31,6 +35,7 @@
     "class-transformer": "^0.5.1",
     "class-validator": "^0.15.1",
     "decimal.js": "^10.6.0",
+    "dotenv": "^18.0.8",
     "reflect-metadata": "^0.2.2",
     "rxjs": "^7.8.1"
   },
