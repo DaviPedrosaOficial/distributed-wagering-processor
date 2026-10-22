@@ -20,12 +20,13 @@ Docker Compose.
 - Abertura e consulta de carteiras pela API HTTP.
 - Abertura positiva com OPENING, ledger e eventos da outbox no mesmo commit,
   preservando a versão inicial `1`.
-- Processamento HTTP de BET, WIN e LOSS com bloqueio de linha por carteira.
+- Processamento HTTP de BET, WIN, LOSS, REFUND e ROLLBACK com bloqueio por carteira.
+- Referências validadas e espera persistida com reprocessamento agendado e TTL.
 - Idempotência persistida, comparação de payload e replay do resultado histórico.
 - Saldo, transação, ledger e outbox gravados atomicamente, com rejeições auditáveis.
 - Restrições de integridade no PostgreSQL.
 
-O projeto está em desenvolvimento. Referências, REFUND, ROLLBACK, integração SQS,
+O projeto está em desenvolvimento. Integração SQS,
 consultas de ledger/transações, reconciliação e validação com múltiplos processos
 ainda estão pendentes. Os eventos da outbox são armazenados, mas ainda não publicados.
 A API atual não possui autenticação.
@@ -49,7 +50,7 @@ Confira as variáveis do `.env` antes da execução. Por padrão, a API atende e
 | --- | --- | --- |
 | POST | /wallets | Abrir carteira |
 | GET | /wallets/:walletId | Consultar carteira |
-| POST | /wagering/transactions | Processar BET, WIN ou LOSS |
+| POST | /wagering/transactions | Processar apostas, resultados e reversões |
 
 Exemplo de corpo para criação:
 
@@ -60,10 +61,12 @@ Exemplo de corpo para criação:
 }
 ```
 
-A submissão de operações exige o header `Idempotency-Key`. Uma repetição idêntica
+A submissão de operações exige o header `Idempotency-Key`. Uma operação finalizada,
+quando reenviada sem alterações,
 retorna o resultado original com `idempotentReplay: true`; conteúdo diferente com
-a mesma chave gera 409. Rejeições financeiras retornam 422. Referências e estornos
-ainda são recusados explicitamente.
+a mesma chave gera 409. Rejeições financeiras retornam 422; operações aguardando
+referência retornam 202. O worker tenta novamente com intervalos crescentes até
+o TTL de 15 minutos. Ele inicia com a API; `REFERENCE_WORKER_ENABLED=false` o desativa.
 
 ## Validar
 
@@ -84,12 +87,14 @@ bun run test:e2e
 **Use um banco separado terminado em `_test`: a suíte reverte e reaplica as
 migrations, removendo os dados desse banco de testes.**
 
-Validação realizada: **103 testes unitários e 31 testes HTTP/SQL aprovados**, com
+Validação realizada: **108 testes unitários e 44 testes HTTP/SQL aprovados**, com
 PostgreSQL 17 em Docker, além de build e lint sem erros.
 
 As decisões, justificativas e limitações estão em
 [ARCHITECTURE.md](ARCHITECTURE.md). O passo a passo da abertura e dos comandos
 está em [GUIA-ABERTURA.md](GUIA-ABERTURA.md); o processamento externo é explicado
-em [GUIA-TRANSACOES.md](GUIA-TRANSACOES.md).
+em [GUIA-TRANSACOES.md](GUIA-TRANSACOES.md). Referências e reprocessamento estão
+em [GUIA-REFERENCIAS.md](GUIA-REFERENCIAS.md).
 
-Desafio de referência: [Jungle Gaming — Backend Challenge](https://github.com/junglegaming/backend-challenge).
+Desafio de referência: [Jungle Gaming — Backend
+Challenge](https://github.com/junglegaming/backend-challenge).

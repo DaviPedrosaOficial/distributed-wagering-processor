@@ -21,7 +21,11 @@ export class WageringController {
         : randomUUID();
     const result = await this.service.execute(body, key, correlationId);
     response.status(
-      result.status === WagerTransactionStatus.Rejected ? 422 : 200,
+      result.status === WagerTransactionStatus.PendingReference
+        ? 202
+        : result.status === WagerTransactionStatus.Rejected
+          ? 422
+          : 200,
     );
     response.setHeader("X-Correlation-Id", correlationId);
     return result;

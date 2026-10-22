@@ -1,4 +1,5 @@
 import "dotenv/config";
+import { ReferenceScheduleRecordSchema } from "./entities/reference-schedule.record.js";
 import { defineConfig } from "@mikro-orm/postgresql";
 import { Migrator } from "@mikro-orm/migrations";
 import { WalletRecordSchema } from "./entities/wallet.record.js";
@@ -38,6 +39,7 @@ export default defineConfig({
     WagerTransactionRecordSchema,
     WalletLedgerRecordSchema,
     OutboxRecordSchema,
+    ReferenceScheduleRecordSchema,
   ],
 
   extensions: [Migrator],

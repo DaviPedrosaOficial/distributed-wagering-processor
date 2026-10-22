@@ -1,4 +1,7 @@
 import "reflect-metadata";
+import { ProcessTransactionService } from "../src/wagering/application/process-transaction.service.js";
+import { ReferenceRetryWorker } from "../src/wagering/application/reference-retry.worker.js";
+import { ReferenceScheduleRecord } from "../src/database/entities/reference-schedule.record.js";
 import { WageringModule } from "../src/wagering/wagering.module.js";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Test } from "@nestjs/testing";
@@ -14,12 +17,11 @@ import { WalletLedgerRecord } from "../src/database/entities/wallet-ledger.recor
 import { WagerTransactionRecord } from "../src/database/entities/wager-transaction.record.js";
 import { OutboxRecord } from "../src/database/entities/outbox.record.js";
 import { transactionFromRecord } from "../src/database/mappers/financial-records.mapper.js";
-import {
-  WagerTransactionKind,
-  WagerTransactionStatus,
-} from "../src/wagering/domain/wager-transaction.js";
+import { WagerTransactionKind, WagerTransactionStatus, } from "../src/wagering/domain/wager-transaction.js";
 import { LedgerDirection } from "../src/wallets/domain/wallet-ledger-entry.js";
 import { OpenWalletService } from "../src/wallets/application/open-wallet.service.js";
+
+process.env.REFERENCE_WORKER_ENABLED = "false";
 
 describe("Carteiras e operações (integração PostgreSQL)", () => {
   let app: INestApplication;
@@ -64,7 +66,7 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
 
   test("deve aplicar e reverter migrations sem pendências", async () => {
     expect(await orm.migrator.getPending()).toHaveLength(0);
-    expect(await orm.migrator.getExecuted()).toHaveLength(2);
+    expect(await orm.migrator.getExecuted()).toHaveLength(3);
   });
 
   test("deve salvar carteira, OPENING, ledger e dois eventos com versão 1", async () => {
@@ -307,6 +309,7 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
     gameId: "game-1",
     roundId: "round-1",
     kind,
+    referenceExternalTransactionId: undefined as string | undefined,
     money: { amount, currency: "BRL" },
   });
   const submit = (
@@ -393,7 +396,7 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
     );
   });
 
-  test("valida header, OPENING externo, valor zero, identidade e referência não implementada", async () => {
+  test("valida header, OPENING externo, valor zero, identidade e referência indevida", async () => {
     const wallet = await open();
     const input = operation(wallet);
     await api().post("/wagering/transactions").send(input).expect(400);
@@ -486,11 +489,9 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
       expect(saved.balance).toBe("100.00");
       expect(saved.version).toBe(1);
       expect(
-        await orm.em
-          .fork()
-          .count(WagerTransactionRecord, {
-            externalTransactionId: input.externalTransactionId,
-          }),
+        await orm.em.fork().count(WagerTransactionRecord, {
+          externalTransactionId: input.externalTransactionId,
+        }),
       ).toBe(0);
       expect(
         await orm.em
@@ -519,5 +520,375 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
     const input = operation(wallet, "BET", "100.00");
     expect((await submit(input).expect(200)).body.balance.amount).toBe("0.00");
     await submit(operation({ ...wallet, walletId: randomUUID() })).expect(404);
+  });
+  test("REFUND devolve integralmente a BET e sua referência interna fica persistida", async () => {
+    const wallet = await open();
+    const bet = operation(wallet);
+    const original = await submit(bet).expect(200);
+    const refund = {
+      ...operation(wallet, "REFUND"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    };
+    const result = await submit(refund).expect(200);
+    expect(result.body.balance.amount).toBe("100.00");
+    const record = await orm.em
+      .fork()
+      .findOneOrFail(WagerTransactionRecord, { id: result.body.transactionId });
+    expect(record.referenceTransactionId).toBe(original.body.transactionId);
+    expect((await submit(refund).expect(200)).body.idempotentReplay).toBe(true);
+    expect(
+      (
+        await submit({ ...refund, externalTransactionId: randomUUID() }).expect(
+          422,
+        )
+      ).body.failureCode,
+    ).toBe("INVALID_REFERENCE");
+  });
+
+  test("dois REFUND simultâneos com identidades distintas creditam apenas uma vez", async () => {
+    const wallet = await open();
+    const bet = operation(wallet);
+    await submit(bet).expect(200);
+    const results = await Promise.all(
+      [1, 2].map(() =>
+        submit({
+          ...operation(wallet, "REFUND"),
+          referenceExternalTransactionId: bet.externalTransactionId,
+        }),
+      ),
+    );
+    expect(results.map((r) => r.status).sort((a, b) => a - b)).toEqual([
+      200, 422,
+    ]);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("100.00");
+  });
+
+  test("ROLLBACK inverte BET e também o crédito de REFUND", async () => {
+    const wallet = await open();
+    const bet = operation(wallet);
+    await submit(bet).expect(200);
+    const refund = {
+      ...operation(wallet, "REFUND"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    };
+    await submit(refund).expect(200);
+    const undoRefund = await submit({
+      ...operation(wallet, "ROLLBACK"),
+      referenceExternalTransactionId: refund.externalTransactionId,
+    }).expect(200);
+    expect(undoRefund.body.balance.amount).toBe("75.00");
+    const undoBet = await submit({
+      ...operation(wallet, "ROLLBACK"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    }).expect(200);
+    expect(undoBet.body.balance.amount).toBe("100.00");
+  });
+
+  test("ROLLBACK de WIN sem saldo usa código distinto e não gera ledger", async () => {
+    const wallet = await open();
+    const win = operation(wallet, "WIN", "40.00");
+    await submit(win).expect(200);
+    await submit(operation(wallet, "BET", "140.00")).expect(200);
+    const result = await submit({
+      ...operation(wallet, "ROLLBACK", "40.00"),
+      referenceExternalTransactionId: win.externalTransactionId,
+    }).expect(422);
+    expect(result.body.failureCode).toBe("REVERSAL_INSUFFICIENT_BALANCE");
+    expect(
+      await orm.em.fork().count(WalletLedgerRecord, {
+        transactionId: result.body.transactionId,
+      }),
+    ).toBe(0);
+  });
+
+  test("reversão parcial, rodada divergente, tipo e referência rejeitada são inválidos", async () => {
+    const wallet = await open();
+    const bet = operation(wallet);
+    await submit(bet).expect(200);
+    const refund = {
+      ...operation(wallet, "REFUND"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    };
+    await submit({
+      ...refund,
+      money: { amount: "20.00", currency: "BRL" },
+    }).expect(422);
+    await submit({
+      ...refund,
+      externalTransactionId: randomUUID(),
+      roundId: "other",
+    }).expect(422);
+    const loss = operation(wallet, "LOSS", "0.00");
+    await submit(loss).expect(200);
+    await submit({
+      ...operation(wallet, "ROLLBACK", "25.00"),
+      referenceExternalTransactionId: loss.externalTransactionId,
+    }).expect(422);
+    const rejected = operation(wallet, "BET", "999.00");
+    await submit(rejected).expect(422);
+    await submit({
+      ...operation(wallet, "REFUND", "999.00"),
+      referenceExternalTransactionId: rejected.externalTransactionId,
+    }).expect(422);
+    const other = await open();
+    await submit({
+      ...operation(other, "REFUND"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    }).expect(422);
+  });
+
+  test("WIN referenciado aguarda BET e usa crédito próprio depois", async () => {
+    const wallet = await open();
+    const bet = operation(wallet);
+    const win = {
+      ...operation(wallet, "WIN", "40.00"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    };
+    const pending = await submit(win).expect(202);
+    const schedule = await orm.em
+      .fork()
+      .findOneOrFail(ReferenceScheduleRecord, {
+        transactionId: pending.body.transactionId,
+      });
+    await submit(bet).expect(200);
+    await app
+      .get(ProcessTransactionService)
+      .retryPending(pending.body.transactionId, schedule.nextAttemptAt);
+    const result = await submit(win).expect(200);
+    expect(result.body.balance.amount).toBe("115.00");
+    expect(result.body.idempotentReplay).toBe(true);
+  });
+
+  test("REFUND antes de BET persiste espera, replay pendente e worker processa uma única vez", async () => {
+    const wallet = await open();
+    const bet = operation(wallet);
+    const refund = {
+      ...operation(wallet, "REFUND"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    };
+    const pending = await submit(refund).expect(202);
+    expect(pending.body.status).toBe("PENDING_REFERENCE");
+    expect((await submit(refund).expect(202)).body.idempotentReplay).toBe(true);
+    expect((await api().get(`/wallets/${wallet.walletId}`)).body.version).toBe(
+      1,
+    );
+    const schedule = await orm.em
+      .fork()
+      .findOneOrFail(ReferenceScheduleRecord, {
+        transactionId: pending.body.transactionId,
+      });
+    await submit(bet).expect(200);
+    await app.get(ReferenceRetryWorker).runDue(schedule.nextAttemptAt);
+    const result = await submit(refund).expect(200);
+    expect(result.body.transactionId).toBe(pending.body.transactionId);
+    expect(result.body.balance.amount).toBe("100.00");
+    expect(
+      await orm.em.fork().count(ReferenceScheduleRecord, {
+        transactionId: pending.body.transactionId,
+      }),
+    ).toBe(0);
+    expect(
+      await orm.em.fork().count(WalletLedgerRecord, {
+        transactionId: pending.body.transactionId,
+      }),
+    ).toBe(1);
+    expect(
+      await app
+        .get(ProcessTransactionService)
+        .retryPending(pending.body.transactionId, schedule.nextAttemptAt),
+    ).toBe(false);
+  });
+
+  test("sondagem respeita vencimento, aplica backoff e expira a referência sem novo saldo", async () => {
+    const wallet = await open();
+    const refund = {
+      ...operation(wallet, "REFUND"),
+      referenceExternalTransactionId: randomUUID(),
+    };
+    const pending = await submit(refund).expect(202);
+    let schedule = await orm.em.fork().findOneOrFail(ReferenceScheduleRecord, {
+      transactionId: pending.body.transactionId,
+    });
+    const service = app.get(ProcessTransactionService);
+    expect(
+      await service.retryPending(
+        pending.body.transactionId,
+        new Date(schedule.nextAttemptAt.getTime() - 1),
+      ),
+    ).toBe(false);
+    await service.retryPending(
+      pending.body.transactionId,
+      schedule.nextAttemptAt,
+    );
+    schedule = await orm.em.fork().findOneOrFail(ReferenceScheduleRecord, {
+      transactionId: pending.body.transactionId,
+    });
+    expect(schedule.attempts).toBe(1);
+    expect(
+      await orm.em.fork().count(OutboxRecord, {
+        aggregateId: wallet.walletId,
+        eventType: "WagerTransactionPendingReference",
+      }),
+    ).toBe(1);
+    await service.retryPending(pending.body.transactionId, schedule.expiresAt);
+    const expired = await submit(refund).expect(422);
+    expect(expired.body.failureCode).toBe("REFERENCE_NOT_FOUND");
+    expect(
+      await orm.em.fork().count(OutboxRecord, {
+        aggregateId: wallet.walletId,
+        eventType: "WagerTransactionRejected",
+      }),
+    ).toBe(1);
+    expect(
+      await orm.em.fork().count(WalletLedgerRecord, {
+        transactionId: pending.body.transactionId,
+      }),
+    ).toBe(0);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("100.00");
+  });
+
+  test("workers concorrentes reavaliam o agendamento depois do lock da carteira", async () => {
+    const wallet = await open();
+    const bet = operation(wallet);
+    const refund = {
+      ...operation(wallet, "REFUND"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    };
+    const pending = await submit(refund).expect(202);
+    const schedule = await orm.em
+      .fork()
+      .findOneOrFail(ReferenceScheduleRecord, {
+        transactionId: pending.body.transactionId,
+      });
+    await submit(bet).expect(200);
+    const service = app.get(ProcessTransactionService);
+    const results = await Promise.all([
+      service.retryPending(pending.body.transactionId, schedule.nextAttemptAt),
+      service.retryPending(pending.body.transactionId, schedule.nextAttemptAt),
+    ]);
+    expect(results.filter(Boolean)).toHaveLength(1);
+    expect(
+      await orm.em.fork().count(WalletLedgerRecord, {
+        transactionId: pending.body.transactionId,
+      }),
+    ).toBe(1);
+  });
+
+  test("contrato exige referência de reversões e rejeita referência nula ou autorreferência", async () => {
+    const wallet = await open();
+    await submit(operation(wallet, "REFUND")).expect(400);
+    await submit(operation(wallet, "ROLLBACK")).expect(400);
+    await submit({
+      ...operation(wallet, "WIN"),
+      referenceExternalTransactionId: null,
+    } as unknown as ReturnType<typeof operation>).expect(400);
+    const self = operation(wallet, "REFUND");
+    await submit({
+      ...self,
+      referenceExternalTransactionId: self.externalTransactionId,
+    }).expect(422);
+  });
+  test("restrição SQL impede outra reversão processada da mesma referência e tipo", async () => {
+    const wallet = await open();
+    const bet = operation(wallet);
+    await submit(bet).expect(200);
+    const refund = await submit({
+      ...operation(wallet, "REFUND"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    }).expect(200);
+    let failure: unknown;
+    try {
+      await orm.em
+        .getConnection()
+        .execute(
+          `insert into wager_transactions select (jsonb_populate_record(null::wager_transactions, to_jsonb(t) || jsonb_build_object('id', ?::text, 'external_transaction_id', ?::text, 'idempotency_key', ?::text))).* from wager_transactions t where t.id = ?::uuid`,
+          [randomUUID(), randomUUID(), randomUUID(), refund.body.transactionId],
+        );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeDefined();
+    expect(String(failure)).toContain("wager_transactions_reversal_unique");
+  });
+
+  test("outro worker reconstrói pendências do banco sem estado em memória", async () => {
+    const wallet = await open();
+    const bet = operation(wallet);
+    const refund = {
+      ...operation(wallet, "REFUND"),
+      referenceExternalTransactionId: bet.externalTransactionId,
+    };
+    const pending = await submit(refund).expect(202);
+    const schedule = await orm.em
+      .fork()
+      .findOneOrFail(ReferenceScheduleRecord, {
+        transactionId: pending.body.transactionId,
+      });
+    await submit(bet).expect(200);
+    const restartedWorker = new ReferenceRetryWorker(
+      orm,
+      new ProcessTransactionService(orm),
+    );
+    await restartedWorker.runDue(schedule.nextAttemptAt);
+    expect((await submit(refund).expect(200)).body.balance.amount).toBe(
+      "100.00",
+    );
+  });
+  test("expiração e remoção do agendamento são revertidas se o evento de rejeição falhar", async () => {
+    const wallet = await open();
+    const input = {
+      ...operation(wallet, "REFUND"),
+      referenceExternalTransactionId: randomUUID(),
+    };
+    const pending = await submit(input).expect(202);
+    const schedule = await orm.em
+      .fork()
+      .findOneOrFail(ReferenceScheduleRecord, {
+        transactionId: pending.body.transactionId,
+      });
+    const connection = orm.em.getConnection();
+    await connection.execute(
+      `create function fail_reference_outbox() returns trigger language plpgsql as $$ begin raise exception 'Falha simulada'; end; $$;`,
+    );
+    await connection.execute(
+      `create trigger fail_reference_outbox before insert on outbox_messages for each row execute function fail_reference_outbox();`,
+    );
+    try {
+      await expectRejection(
+        app
+          .get(ProcessTransactionService)
+          .retryPending(pending.body.transactionId, schedule.expiresAt),
+      );
+      expect((await submit(input).expect(202)).body.status).toBe(
+        "PENDING_REFERENCE",
+      );
+      expect(
+        await orm.em
+          .fork()
+          .count(ReferenceScheduleRecord, {
+            transactionId: pending.body.transactionId,
+          }),
+      ).toBe(1);
+      expect(
+        await orm.em
+          .fork()
+          .count(WalletLedgerRecord, {
+            transactionId: pending.body.transactionId,
+          }),
+      ).toBe(0);
+    } finally {
+      await connection.execute(
+        `drop trigger fail_reference_outbox on outbox_messages;`,
+      );
+      await connection.execute(`drop function fail_reference_outbox();`);
+    }
+    await app
+      .get(ProcessTransactionService)
+      .retryPending(pending.body.transactionId, schedule.expiresAt);
+    await submit(input).expect(422);
   });
 });

@@ -68,6 +68,11 @@ export const WagerTransactionRecordSchema =
     },
     uniques: [
       {
+        name: "wager_transactions_reversal_unique",
+        properties: ["referenceTransactionId", "kind"],
+        where: "status = 'PROCESSED' and kind in ('REFUND', 'ROLLBACK')",
+      },
+      {
         name: "wager_transactions_idempotency_unique",
         properties: ["idempotencyKey"],
       },
@@ -83,6 +88,11 @@ export const WagerTransactionRecordSchema =
       },
     ],
     checks: [
+      {
+        name: "wager_transactions_resolved_reversal",
+        expression:
+          "status <> 'PROCESSED' or kind not in ('REFUND','ROLLBACK') or reference_transaction_id is not null",
+      },
       {
         name: "wager_transactions_amount_range",
         expression: "amount >= 0 AND amount <= 999999999999999999.99",

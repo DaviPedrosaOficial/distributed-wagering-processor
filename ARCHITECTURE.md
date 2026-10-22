@@ -71,9 +71,10 @@ O trade-off é que a abertura depende de todas essas gravações, inclusive da
 outbox. Aceitei esse custo para não confirmar dados financeiros sem registrar
 os eventos correspondentes. Nenhuma chamada a serviço externo ocorre nesse fluxo.
 
-ProcessTransactionService aplica BET, WIN e LOSS. BET debita, WIN credita e LOSS
-registra o resultado sem alterar saldo ou gerar ledger. BET e WIN exigem valor
-positivo. LOSS aceita zero ou valor positivo, mas nunca movimenta esse valor.
+ProcessTransactionService aplica BET, WIN, LOSS, REFUND e ROLLBACK. BET debita,
+WIN credita e LOSS registra o resultado sem alterar saldo ou gerar ledger.
+BET, WIN e reversões exigem valor positivo. LOSS aceita zero ou valor positivo, mas
+nunca movimenta esse valor.
 Jogador e carteira precisam corresponder; moeda incompatível e saldo insuficiente
 produzem rejeições persistidas, sem movimentação.
 
@@ -90,10 +91,15 @@ mudanças de saldo, não um mecanismo de optimistic locking. LOSS, rejeição e 
 não a incrementam. Não há retry automático implementado para falhas de bloqueio.
 
 Transação externa, atualização da carteira, ledger e outbox também são atômicos.
-O primeiro flush grava a transação já processada ou rejeitada, permitindo que o
+O primeiro flush grava o estado da transação, permitindo que o
 trigger do ledger encontre seu estado. O segundo envia as demais gravações.
 Ambos ocorrem antes do commit: uma falha posterior reverte inclusive o primeiro
 flush. A resposta só sai após a conclusão de transactional().
+
+A entrada HTTP usa execute(); o worker retoma operações por retryPending(). Ambos
+utilizam o método privado apply(), evitando duplicar regras financeiras. Uma
+retomada reidrata a operação existente e mantém seu transactionId. Agendamento,
+transição de estado e eventos também participam da mesma transação SQL.
 
 ## 4. Garantias no PostgreSQL e imutabilidade do ledger
 
@@ -118,8 +124,16 @@ manter SQL customizado nas migrations e revisar as alterações geradas. Elas n�
 substituem as regras completas de processamento de apostas e reversões.
 
 Preservei a primeira migration e acrescentei uma segunda para converter o ID da
-carteira de texto para UUID e criar as demais tabelas. Ambas possuem up() e down().
+carteira de texto para UUID e criar as demais tabelas. Uma terceira migration cria
+reference_schedules, o índice único parcial de
+reversões e a validação SQL da referência processada. As três possuem up() e down().
 A aplicação não sincroniza automaticamente o schema na inicialização.
+
+O índice único (reference_transaction_id, kind), limitado a REFUND e ROLLBACK
+PROCESSED, impede duas reversões processadas do mesmo tipo sobre a mesma
+referência. O check exige referência interna para reversões processadas. Um
+trigger valida o vínculo de uma referência processada com a identidade externa,
+contexto, tipo permitido e valor integral quando aplicável.
 
 ## 5. Estados, referências e códigos de falha
 
@@ -131,14 +145,29 @@ WagerTransaction nasce em PENDING. Os métodos públicos controlam as transiçõ
 | PENDING_REFERENCE | PROCESSED, REJECTED, FAILED |
 | PROCESSED, REJECTED, FAILED | Nenhum |
 
-REFUND e ROLLBACK exigem referência externa. Somente esses tipos podem entrar em
-PENDING_REFERENCE. Repetir a marcação mantém o estado de espera. Tentativas de
+REFUND e ROLLBACK exigem referência externa. WIN pode omiti-la; quando informada,
+também pode aguardar em PENDING_REFERENCE. Repetir a marcação mantém o estado de espera.
+Tentativas de
 mudar um estado terminal lançam InvalidTransactionStateError, inclusive após a
 reidratação.
 
 Separei referenceExternalTransactionId, recebido do provedor, de
 referenceTransactionId, o identificador interno informado após a resolução.
-O modelo não consulta o banco nem comprova sozinho a validade da referência.
+O modelo não consulta o banco. O serviço busca a referência por (providerId,
+referenceExternalTransactionId), e referenceIsCompatible() valida mesmo provedor,
+jogador, carteira, moeda e rodada. Não acrescentei igualdade de gameId, pois ela
+não é exigida pelo enunciado. Referência à própria operação é inválida.
+
+REFUND só reembolsa BET processada, com valor integral. ROLLBACK aceita BET, WIN
+ou REFUND processado, também com valor integral, e aplica uma nova movimentação
+inversa; não altera o ledger original. WIN referenciado exige BET processada,
+mas seu valor pode ser diferente. BET e LOSS não aceitam referências.
+
+Referências incompatíveis, rejeitadas, falhas ou já revertidas pelo mesmo tipo
+geram INVALID_REFERENCE. A restrição é por tipo: uma BET pode ter um REFUND e um
+ROLLBACK processados; dois REFUND ou dois ROLLBACK sobre ela são impedidos.
+Uma rejeição não reserva a referência. ROLLBACK que debitaria além do saldo gera
+REVERSAL_INSUFFICIENT_BALANCE, distinto da insuficiência de uma aposta.
 
 Os códigos declarados em FailureCode são:
 
@@ -153,10 +182,44 @@ Os códigos declarados em FailureCode são:
 
 reject() registra rejeição de negócio; fail() registra falha permanente. Ambos
 validam a existência do código no enum, mas ainda não restringem seus membros por
-categoria. O fluxo atual utiliza INSUFFICIENT_BALANCE e CURRENCY_MISMATCH nas rejeições.
-A resolução de referências e a política de espera/reprocessamento não estão
-implementadas. O código REFERENCE_NOT_FOUND não
-significa que já exista um worker ou um limite de tentativas definido.
+categoria. O fluxo integrado utiliza os códigos de negócio acima.
+PERMANENT_INFRASTRUCTURE_FAILURE permanece declarado no domínio; ainda não há
+classificação operacional integrada que finalize transações com esse código.
+
+### Espera persistida e política de reprocessamento
+
+Uma referência ausente, ou ainda não terminal e compatível, mantém a operação em
+PENDING_REFERENCE. Saldo, versão e ledger não mudam. Na mesma transação SQL,
+reference_schedules armazena transactionId, attempts, nextAttemptAt, expiresAt e
+correlationId; a outbox recebe WagerTransactionPendingReference.
+
+Adotei TTL de 15 minutos desde a criação, sem limite adicional por quantidade
+de tentativas. O primeiro intervalo é 5 segundos; os seguintes são 10, 20, 40,
+80, 160 e 300 segundos, com teto de 300. O próximo horário não ultrapassa o
+vencimento. A escolha limita a espera e reduz consultas repetidas, mas é uma
+política do desafio, não um SLA derivado de um provedor real.
+
+O prazo é verificado antes da resolução na retomada: vencido o TTL, a operação
+é rejeitada com REFERENCE_NOT_FOUND, mesmo que a referência tenha se tornado
+disponível enquanto aguardava a próxima execução. A rejeição, seu evento e a
+remoção do agendamento são atômicos. Uma referência tardia não reabre o estado
+terminal. Cada sondagem sem resolução incrementa attempts e atualiza a próxima
+tentativa, sem emitir outro evento de entrada em espera.
+
+ReferenceRetryWorker consulta até 50 itens devidos por varredura, a cada segundo.
+A seleção só encontra candidatos; retryPending() bloqueia carteira e agendamento,
+nessa ordem, e revalida horário e estado dentro da transação. Assim, outra
+execução não repete uma movimentação já confirmada nem antecipa um reagendamento.
+O agendamento sobrevive ao reinício porque fica no PostgreSQL. O custo é fazer
+consultas periódicas, e sob carga o processamento pode ocorrer após o horário
+previsto. Falhas de infraestrutura não confirmam a tentativa; o item permanece
+para nova varredura, sem uma política separada de backoff para essas falhas.
+
+O worker roda dentro da aplicação Nest. REFERENCE_WORKER_ENABLED=false o desativa;
+por padrão está habilitado. Um controle local evita sobrepor suas próprias
+varreduras, enquanto os locks SQL protegem execuções de instâncias distintas.
+Os hooks de desligamento interrompem novas varreduras e aguardam a ativa.
+Isso ainda não implementa encerramento ou devolução de visibilidade de mensagens SQS.
 
 ## 6. Resultado histórico e identidade da operação
 
@@ -188,9 +251,16 @@ são comparadas conforme recebidas, sem normalização Unicode ou remoção de e
 Essa canonicalização é específica deste contrato, não um algoritmo JSON genérico.
 
 O serviço devolve result_balance da operação processada, sem consultar o saldo
-atual. Uma aposta que deixou 75.00 continua retornando 75.00 após um prêmio levar
-a carteira a 115.00. Apenas idempotentReplay muda para true. Rejeições também são
+atual. Considere saldo inicial de 100.00: uma aposta de 25.00 deixa 75.00, e um
+prêmio posterior de 40.00 leva a carteira a 115.00. Se o provedor reenviar o mesmo
+pedido daquela aposta, devolvemos seu saldo histórico de 75.00 e o mesmo
+transactionId, com idempotentReplay=true. Não há outro débito: o saldo atual
+continua em 115.00. Rejeições também são
 repetidas com o resultado registrado; saldo posterior não as transforma em sucesso.
+Enquanto aguarda referência, o replay devolve PENDING_REFERENCE e HTTP 202, sem
+novo agendamento ou evento. Após a retomada, devolve o resultado terminal da mesma
+transação. Portanto, uma resposta pendente pode evoluir; resultados terminais
+permanecem históricos.
 
 O bloqueio por carteira serializa as repetições sobre a mesma carteira. Para
 colisões de chave entre carteiras distintas, as restrições UNIQUE decidem a
@@ -204,10 +274,14 @@ positiva. Cada um possui uma classe concreta com eventType e versão `1`, basead
 em IntegrationEvent. O envelope contém eventId, aggregateId, correlationId,
 causationId, occurredAt e data.
 
-No processamento externo, BET e WIN geram WagerTransactionProcessed e
+No processamento externo, BET, WIN e reversões processadas geram
+WagerTransactionProcessed e
 WalletBalanceChanged; LOSS gera somente WagerTransactionProcessed. Rejeições
 geram WagerTransactionRejected, incluindo um failureCode estável. Replay não cria
-novos eventos nem lançamentos.
+novos eventos nem lançamentos. A entrada em espera gera
+WagerTransactionPendingReference; sua expiração gera WagerTransactionRejected.
+Os eventos de espera e conclusão compartilham a correlação preservada no
+agendamento, com IDs próprios e causationId da transação.
 
 A serialização usa datas ISO e MoneyProps, sem instâncias de Money. Cópias dos
 dados isolam o envelope dos objetos externos. A versão do evento identifica seu
@@ -241,14 +315,15 @@ prévia, isoladamente, não impediria duas inserções concorrentes.
 O X-Correlation-Id é aceito dentro do formato limitado do controller ou substituído
 por um UUID gerado. Esse identificador correlaciona os eventos; não é chave de
 idempotência nem autorização. Os endpoints atuais não possuem autenticação.
-POST /wagering/transactions aceita BET, WIN e LOSS. OPENING é exclusivamente
-interno e o identificador de provedor __internal__ é reservado. REFUND, ROLLBACK e
-pedidos com referência externa ainda são recusados explicitamente como entrada
-não suportada, inclusive WIN com referência. Não são aceitos como pendências.
+POST /wagering/transactions aceita BET, WIN, LOSS, REFUND e ROLLBACK.
+OPENING é exclusivamente interno e o identificador de provedor `__internal__` é
+reservado. Os DTOs validam referências opcionais quando presentes, rejeitando
+null; o serviço exige referência para as reversões.
 
 | Situação no processamento externo | HTTP |
 | --- | --- |
 | Operação processada ou replay processado | 200 |
+| Operação aguardando referência ou seu replay pendente | 202 |
 | Payload, valor ou chave inválidos; recurso não suportado | 400 |
 | Carteira inexistente | 404 |
 | Conflito de idempotência ou identidade externa | 409 |
@@ -259,19 +334,24 @@ não suportada, inclusive WIN com referência. Não são aceitos como pendência
 O serviço traduz exceções de conexão e os SQLSTATE 40001, 40P01, 55P03, 57014,
 57P01, 57P02 e 57P03 em TRANSIENT_DATABASE_FAILURE. Erros inesperados são
 propagados e provocam rollback. Esse tratamento ainda é local ao processamento,
-não uma política global aplicada a todos os endpoints. A API ainda não oferece
-um fluxo de aceite pendente. Autenticação e seu ponto de extensão continuam
+não uma política global aplicada a todos os endpoints. Autenticação e seu ponto de
+extensão continuam
 pendentes; verificar o playerId não comprova a identidade de quem chama a API.
 
 ## 9. Validação e limites conhecidos
 
-Build e lint passaram sem avisos. Foram aprovados 103 testes unitários e 31
+Build e lint passaram sem avisos. Foram aprovados 108 testes unitários e 44
 testes HTTP/SQL no ambiente local com PostgreSQL 17 em Docker.
 
 A suíte integrada verifica up/down das migrations, abertura positiva e zero,
 versão inicial, duplicidade, precisão monetária, consulta e restrições SQL.
 No processamento, cobre BET, WIN, LOSS, replay histórico, conflitos e rejeições,
-além de rollback quando a outbox falha após o primeiro flush.
+além de rollback quando a outbox falha após o primeiro flush. A ampliação cobre
+reversões, referências incompatíveis, WIN referenciado, chegada fora de ordem,
+backoff e expiração. Também verifica chamadas concorrentes de reprocessamento,
+restrição SQL de reversões, retomada por outro objeto de worker e rollback da
+expiração se a outbox falhar. Os testes usam horários explícitos e desativam o
+timer automático para não depender de sleeps ou esperar 15 minutos.
 
 Os cenários concorrentes executados incluem duas apostas de 80.00 disputando
 100.00, cinquenta pedidos simultâneos da mesma operação e uma chave disputada
@@ -281,10 +361,10 @@ com três ou mais processos independentes.
 
 O banco indicado por POSTGRES_TEST_DB é separado e deve terminar em _test,
 pois a suíte reverte e reaplica migrations nele. Não há sincronização automática
-do schema nem alterações novas de migration neste bloco de processamento.
+do schema na inicialização.
 
-Referências fora de ordem, REFUND, ROLLBACK, inbox, publicação/consumo SQS,
-recuperação após interrupção de workers, consultas de ledger/transações,
-reconciliação, health checks e observabilidade operacional ainda estão pendentes.
-As decisões de TTL/backoff de referências e coordenação de publishers não foram
-tomadas. Não há alegação de atendimento integral do desafio.
+Inbox, publicação/consumo SQS, coordenação entre publishers, recuperação após
+interrupção real de processos, consultas de ledger/transações, reconciliação,
+health checks e observabilidade operacional completa ainda estão pendentes.
+Recriar um objeto de worker não comprova recuperação após matar um processo. Não há
+alegação de atendimento integral do desafio.

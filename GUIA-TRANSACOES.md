@@ -1,6 +1,6 @@
 # Primeiro bloco de processamento externo
 
-Este bloco acrescenta BET, WIN e LOSS por HTTP. REFUND, ROLLBACK e referências ainda não estão integrados e são rejeitados explicitamente. Não há worker SQS, inbox ou publicador da outbox neste pacote.
+Este guia explica a base de BET, WIN e LOSS por HTTP. O incremento de referências, REFUND, ROLLBACK e worker agendado está em [GUIA-REFERENCIAS.md](GUIA-REFERENCIAS.md). Não há worker SQS, inbox ou publicador da outbox.
 
 ## Como aplicar e validar
 
@@ -18,11 +18,11 @@ bun run test:e2e
 
 POSTGRES_TEST_DB precisa continuar configurado com um banco separado, terminado em _test. A suíte existente reverte e reaplica migrations nesse banco; nunca aponte para dados que deseja preservar. Não é necessário criar uma migration para este bloco.
 
-A expectativa é 103 testes unitários e 31 testes de integração/HTTP. A verificação local do assistente usa PGlite; os cenários concorrentes precisam ser executados também contra seu PostgreSQL 17 no Docker. Esta suíte ainda não comprova os requisitos de três processos independentes, SQS ou recuperação após matar um worker.
+No primeiro bloco foram validados 103 testes unitários e 31 testes de integração/HTTP. O incremento de referências amplia essa suíte. A verificação local do assistente usa PGlite; os cenários concorrentes precisam ser executados também contra seu PostgreSQL 17 no Docker. Esta suíte ainda não comprova os requisitos de três processos independentes, SQS ou recuperação após matar um worker.
 
 ## O caminho de uma aposta
 
-1. WageringController recebe POST /wagering/transactions. O DTO valida os campos e exclui OPENING, REFUND e ROLLBACK dos tipos aceitos nesta etapa. O header Idempotency-Key é obrigatório. O controlador recebe ou gera X-Correlation-Id.
+1. WageringController recebe POST /wagering/transactions. O DTO valida os campos e exclui OPENING da entrada externa; os tipos de reversão foram acrescentados no incremento de referências. O header Idempotency-Key é obrigatório. O controlador recebe ou gera X-Correlation-Id.
 2. ProcessTransactionService valida o valor com Money e calcula o hash do conteúdo de negócio. Uma movimentação BET ou WIN deve ser maior que zero. LOSS pode ter valor zero e nunca gera movimentação.
 3. O serviço abre uma transação SQL usando um EntityManager independente. Busca a carteira com LockMode.PESSIMISTIC_WRITE, equivalente ao bloqueio de linha FOR UPDATE do PostgreSQL.
 4. Depois de obter o bloqueio, procura uma operação com a mesma chave de idempotência ou a mesma identidade externa (providerId, externalTransactionId). Se já existe, compara chave e hash e devolve seu resultado persistido. Não executa wallet.debit() novamente.
@@ -57,7 +57,7 @@ O resultado de JSON.stringify é convertido para SHA-256 hexadecimal em UTF-8. I
 
 ## Histórico, ledger e outbox
 
-Uma aposta de R$ 25 deixa R$ 75. Um prêmio posterior de R$ 40 deixa R$ 115. Repetir a aposta retorna R$ 75, com o mesmo transactionId e idempotentReplay: true. Não consulta o saldo atual para reconstruir essa resposta.
+Considere uma carteira com saldo inicial de R$ 100. Uma aposta de R$ 25 reduz o saldo para R$ 75; depois, um prêmio de R$ 40 aumenta o saldo para R$ 115. Se o provedor reenviar o mesmo pedido da aposta já processada, o sistema não fará outro débito: devolverá o resultado original daquela operação, com saldo histórico de R$ 75, o mesmo transactionId e idempotentReplay: true. O saldo atual da carteira continuará sendo R$ 115. Esse resultado é recuperado da transação persistida, sem consultar o saldo atual para reconstruí-lo.
 
 BET e WIN geram WagerTransactionProcessed e WalletBalanceChanged. LOSS gera apenas WagerTransactionProcessed. Uma rejeição gera WagerTransactionRejected. Esses objetos são persistidos na outbox e permanecem aguardando publicação; este código não envia mensagens a um broker.
 
@@ -89,4 +89,4 @@ Uma operação rejeitada também é idempotente: se foi recusada por saldo insuf
 | 503 | Falha transitória reconhecida de conexão, serialização, deadlock ou indisponibilidade do PostgreSQL. |
 | 500 | Falha inesperada; a transação financeira é revertida. |
 
-O mapeamento de infraestrutura ainda não é global para todos os endpoints. Mensageria, pendência de referências, reprocessamento, consultas de transações, reconciliação e validação com múltiplos processos serão os próximos blocos.
+O mapeamento de infraestrutura ainda não é global para todos os endpoints. Referências e reprocessamento agora estão descritos em GUIA-REFERENCIAS.md. Mensageria, consultas de transações, reconciliação e validação com múltiplos processos permanecem pendentes.

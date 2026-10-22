@@ -1,5 +1,5 @@
 import { Type } from "class-transformer";
-import { IsIn, IsObject, IsOptional, IsString, IsUUID, Matches, MaxLength, ValidateNested, } from "class-validator";
+import { IsIn, IsObject, ValidateIf, IsString, IsUUID, Matches, MaxLength, ValidateNested, } from "class-validator";
 import { InitialBalanceDto } from "../../wallets/http/create-wallet.dto.js";
 import { WagerTransactionKind } from "../domain/wager-transaction.js";
 
@@ -14,13 +14,15 @@ export class SubmitTransactionDto {
     WagerTransactionKind.Bet,
     WagerTransactionKind.Win,
     WagerTransactionKind.Loss,
+    WagerTransactionKind.Refund,
+    WagerTransactionKind.Rollback,
   ])
   kind!: WagerTransactionKind;
   @IsObject()
   @ValidateNested()
   @Type(() => InitialBalanceDto)
   money!: InitialBalanceDto;
-  @IsOptional()
+  @ValidateIf((_object, value: unknown) => value !== undefined)
   @IsString()
   @Matches(/\S/)
   @MaxLength(255)

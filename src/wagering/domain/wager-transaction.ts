@@ -225,7 +225,7 @@ export class WagerTransaction {
     markPendingReference(): void {
         this.assertNotTerminal();
 
-        if (!this.requiresReference()) {
+        if (!this.requiresReference() && !(this.kind === WagerTransactionKind.Win && this.referenceExternalTransactionId !== undefined)) {
             throw new InvalidWagerTransactionError('Este tipo de transação não exige aguardar uma referência.',);
         }
 
