@@ -1,84 +1,165 @@
 # Decisões de arquitetura
 
-## Escolha do ORM
+Este documento registra as decisões tomadas durante o desenvolvimento do
+Distributed Wagering Processor, seus motivos e as limitações conhecidas.
+As decisões são acrescentadas conforme os respectivos assuntos são trabalhados.
 
-Escolhi MikroORM para integrar a aplicação ao PostgreSQL.
-TypeORM também é aceito pelo desafio, mas segui com MikroORM
-por ser a opção preferida do enunciado e oferecer recursos
-para organizar a persistência, como EntityManager e Unit of Work.
+## 1. Escolha do ORM e separação do domínio
 
-O EntityManager é o objeto usado para consultar dados e coordenar
-sua persistência. A Unit of Work acompanha os objetos carregados
-e suas alterações, identificando o que precisa ser inserido,
-atualizado ou removido ao sincronizar com o banco.
+Escolhi MikroORM para integrar a aplicação ao PostgreSQL. Além de ser a opção
+preferida no desafio, ele oferece EntityManager e Unit of Work para organizar
+consultas e persistência.
 
-Esses recursos ajudam a organizar operações que envolvem vários
-registros. Porém, não garantem sozinhos a segurança das movimentações:
-ainda precisamos definir as transações SQL, as restrições do banco
-e o controle de concorrência.
+As regras financeiras estão em classes de domínio, sem dependência do NestJS ou
+dos tipos do ORM. Para a carteira, o mapeamento foi definido separadamente em
+WalletRecord e EntitySchema.
 
-## Representação monetária
+Essa separação permite testar as regras sem conexão com o banco. Em contrapartida,
+exige a conversão entre os registros de persistência e os objetos do domínio.
 
-Money recebe valores como strings decimais não negativas,
-com exatamente duas casas, e utiliza decimal.js internamente.
+EntityManager e Unit of Work não garantem sozinhos a segurança das movimentações.
+A conexão configurada não representa uma implementação de transações financeiras
+ou controle de concorrência.
 
-Nesta implementação, as moedas suportadas são BRL e USD.
-A validação verifica tanto o formato do código quanto sua
-presença no conjunto de moedas aceitas.
+## 2. Representação monetária
 
-O modelo mantém a moeda em cada valor monetário para permitir
-a identificação de conflitos entre moedas nas operações.
+Escolhi decimal.js para os cálculos de Money. Os valores entram e saem como strings,
+sem conversão de dinheiro para number.
 
-Os valores são limitados à magnitude máxima de
-999999999999999999.99, compatível com a futura persistência
-em NUMERIC(20, 2).
+Adotei um formato estrito com exatamente duas casas decimais: `"25.00"` é aceito;
+`"25"`, `"25.0"`, mais de duas casas, notação científica, valores não finitos e
+entradas negativas são rejeitados. Isso evita arredondar silenciosamente uma
+entrada fora do formato. O cliente precisa enviar o valor já formatado.
 
-Os cálculos utilizam um construtor independente de decimal.js
-com precisão de 40 dígitos significativos, suficiente para
-somas e subtrações exatas dentro desse intervalo.
-Resultados fora do limite são rejeitados.
+As moedas aceitas são BRL e USD. A validação verifica o formato e a presença no
+conjunto de moedas suportadas. Operações e comparações entre moedas diferentes
+lançam erro de domínio. Não há conversão cambial.
 
-Entradas negativas são proibidas, mas resultados internos podem
-ser negativos. A proibição de saldo negativo pertence à Wallet.
-Soma e subtração retornam novas instâncias e exigem moedas iguais.
+Money é imutável: soma, subtração e inversão de sinal retornam novas instâncias.
+Valores negativos podem surgir em cálculos internos, mas não são aceitos como
+entrada pública nem como saldo de uma carteira.
 
-## Carteira e ledger
+O limite de magnitude é `999999999999999999.99`. Configurei um construtor
+independente de decimal.js com 40 dígitos significativos. Essa precisão comporta
+as somas e subtrações de dois valores dentro do intervalo adotado. Resultados
+fora do limite são rejeitados.
 
-Wallet concentra as regras de movimentação do saldo. Créditos e
-débitos exigem valores positivos e moeda compatível com a carteira.
-Débitos sem saldo suficiente são rejeitados.
+Para a persistência, defini `NUMERIC(20, 2)` para o valor e uma coluna separada
+para a moeda. O mapeamento usa `DecimalType('string')`, preservando o valor como
+string no JavaScript. Essa escolha mantém o limite do domínio compatível com o
+armazenamento definido.
 
-Cada movimentação constrói e valida um WalletLedgerEntry antes
-de alterar saldo, versão e data de atualização da carteira.
-Se a validação falhar, o estado da carteira permanece inalterado.
+## 3. Regras da carteira
 
-Os lançamentos preservam valor, direção e saldos anterior e
-posterior. Sua criação valida a equação financeira, e as datas
-são protegidas por cópias defensivas.
+Wallet concentra as regras de saldo. A abertura recebe o saldo inicial e define
+a versão como `1`. Saldo inicial negativo é rejeitado; zero é permitido. A moeda
+da carteira é obtida do saldo inicial, evitando receber moedas conflitantes em
+dois campos de criação.
 
-A reidratação reconstrói objetos persistidos sem repetir as
-regras de criação.
+Créditos e débitos exigem valores positivos e moeda compatível. Um débito maior
+que o saldo disponível lança InsufficientBalanceError.
 
-Na integração com PostgreSQL, carteira e lançamento deverão
-ser persistidos na mesma transação SQL. Controle de concorrência,
-unicidade e imutabilidade no banco ainda serão implementados.
+Antes de alterar a carteira, a movimentação calcula o novo saldo e constrói seu
+lançamento no ledger. Somente depois dessas validações atualiza saldo, versão e
+data. Se a construção do lançamento falhar, o estado permanece inalterado.
 
-## Ciclo de vida das transações
+A versão aumenta em cada movimentação bem-sucedida. Como esses métodos rejeitam
+valor zero, cada movimentação aceita corresponde a uma mudança de saldo.
 
-WagerTransaction nasce em PENDING e controla suas transições
-por métodos explícitos.
+Essa ordem protege o objeto em memória. Ainda não comprova a gravação atômica da
+carteira e do lançamento no banco.
 
-REFUND e ROLLBACK exigem uma referência externa. Durante o
-processamento, essa referência será resolvida pelo par
-(providerId, referenceExternalTransactionId), obtendo o
-identificador interno da operação original.
+## 4. Lançamentos do ledger
 
-PENDING_REFERENCE representa a espera pela referência.
-PROCESSED, REJECTED e FAILED são estados terminais e não
-permitem novas transições.
+WalletLedgerEntry registra o valor movimentado, a direção, a carteira, a transação
+de origem, os saldos anterior e posterior e a data.
 
-Rejeições e falhas registram um código estável. A reidratação
-preserva o estado persistido e protege as datas por cópias.
+O valor do lançamento deve ser positivo; a direção determina se ele é somado ou
+subtraído. A factory create() verifica a equação financeira e rejeita saldos
+negativos. As operações de Money também verificam a compatibilidade das moedas.
 
-A resolução de referências, a idempotência persistente e a
-integração com o banco ainda serão implementadas.
+O lançamento não oferece métodos de alteração. Seus atributos são readonly e a
+instância é congelada com Object.freeze(). Money já é imutável, e a data recebe
+cópias defensivas.
+
+A verificação aritmética confirma a consistência do próprio lançamento. Ela não
+confirma que o saldo anterior corresponde ao banco nem impede, sozinha, um
+lançamento duplicado. O congelamento do objeto também não protege registros SQL.
+
+## 5. Criação, estados e reidratação
+
+As classes de domínio usam construtores privados e factories para concentrar a
+criação. Nos objetos com estado persistido, rehydrate() reconstrói esse estado
+sem repetir ações de negócio ou regras de transição.
+
+WagerTransaction nasce em PENDING. Adotei as seguintes transições:
+
+| Origem                      | Destinos permitidos                            |
+| --------------------------- | ---------------------------------------------- |
+| PENDING                     | PENDING_REFERENCE, PROCESSED, REJECTED, FAILED |
+| PENDING_REFERENCE           | PROCESSED, REJECTED, FAILED                    |
+| PROCESSED, REJECTED, FAILED | Nenhum                                         |
+
+REFUND e ROLLBACK exigem uma referência externa. Somente esses tipos podem ser
+marcados como PENDING_REFERENCE. Repetir essa marcação mantém o estado de espera.
+
+As mudanças passam por métodos explícitos. Transações finalizadas lançam
+InvalidTransactionStateError quando recebem uma nova tentativa de transição.
+Esse bloqueio também funciona após a reidratação.
+
+Separei a referência recebida do provedor, referenceExternalTransactionId, da
+referência interna, referenceTransactionId. A segunda é informada ao confirmar o
+processamento de uma operação que exige referência. Esses métodos não consultam
+o banco nem verificam sozinhos a existência e a validade da operação original.
+
+Datas são copiadas na criação, na reidratação e nos getters. Isso impede que
+alterações em um Date externo modifiquem o estado interno dos objetos.
+
+## 6. Resultado histórico da transação
+
+Uma transação processada guarda o saldo observado naquele processamento como um
+Money imutável. markProcessed() exige esse saldo e verifica sua moeda e
+não-negatividade antes de alterar o estado.
+
+getProcessedResult() devolve o identificador da transação, o estado PROCESSED e o
+saldo histórico. O método não consulta a carteira. Dessa forma, uma movimentação
+posterior não muda o resultado que a transação representa.
+
+A reidratação restaura esse saldo junto dos demais dados. Consultar o resultado
+sem uma transação processada e um saldo registrado provoca erro de domínio.
+
+A decisão prepara o resultado original para uso em replay. O armazenamento de
+idempotencyKey, payloadHash e resultBalance no objeto ainda não implementa
+persistência, detecção de duplicatas ou replay completo.
+
+## 7. Códigos de falha
+
+Defini códigos estáveis em FailureCode para identificar motivos de rejeição ou
+falha, em vez de depender apenas de mensagens de texto.
+
+| Código                           | Significado definido                            |
+| -------------------------------- | ----------------------------------------------- |
+| INSUFFICIENT_BALANCE             | Saldo insuficiente para uma aposta              |
+| CURRENCY_MISMATCH                | Moeda incompatível                              |
+| REFERENCE_NOT_FOUND              | Referência não encontrada após esgotar a espera |
+| INVALID_REFERENCE                | Referência incompatível com a operação          |
+| REVERSAL_INSUFFICIENT_BALANCE    | Reversão que produziria saldo negativo          |
+| PERMANENT_INFRASTRUCTURE_FAILURE | Falha permanente de infraestrutura              |
+
+reject() registra uma rejeição de negócio em REJECTED. fail() registra uma falha
+permanente em FAILED. Ambos verificam se o código pertence ao enum e impedem
+alterações em estados terminais.
+
+Os códigos já estão declarados, mas a classificação completa dos erros pelo
+processamento integrado ainda não existe. A classe também não restringe quais
+membros do enum cada um desses dois métodos aceita.
+
+## 8. Alcance da validação atual
+
+As decisões de domínio foram verificadas com testes unitários. Eles cobrem
+comportamentos em memória, incluindo preservação do estado em falhas, transições
+e proteção das datas.
+
+A conexão ao PostgreSQL foi verificada e a primeira migration foi gerada. Sua
+aplicação não foi confirmada nesta etapa. Os testes atuais não demonstram ainda
+atomicidade SQL, idempotência persistente nem segurança entre múltiplas instâncias.

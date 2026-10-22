@@ -104,7 +104,14 @@ describe('WagerTransaction', () => {
         const at = new Date('2026-10-21T16:00:00.000Z');
         const originalTime = at.getTime();
 
-        transaction.markProcessed(undefined, at);
+        transaction.markProcessed(
+            undefined,
+            at,
+            Money.from({
+                amount: '75.00',
+                currency: 'BRL',
+            }),
+        );
 
         at.setTime(0);
         transaction.processedAt?.setTime(0);
@@ -130,7 +137,14 @@ describe('WagerTransaction', () => {
         );
         expect(transaction.isTerminal()).toBe(false);
 
-        transaction.markProcessed('internal-original', new Date());
+        transaction.markProcessed(
+            'internal-original',
+            new Date(),
+            Money.from({
+                amount: '75.00',
+                currency: 'BRL',
+            }),
+        );
 
         expect(transaction.status).toBe(WagerTransactionStatus.Processed);
         expect(transaction.referenceTransactionId).toBe(
@@ -146,7 +160,14 @@ describe('WagerTransaction', () => {
         });
 
         expect(() =>
-            transaction.markProcessed(undefined, new Date()),
+            transaction.markProcessed(
+                undefined,
+                new Date(),
+                Money.from({
+                    amount: '75.00',
+                    currency: 'BRL',
+                }),
+            ),
         ).toThrow(InvalidWagerTransactionError);
 
         expect(transaction.status).toBe(WagerTransactionStatus.Pending);
@@ -183,7 +204,14 @@ describe('WagerTransaction', () => {
         const transaction = WagerTransaction.create(transactionProps());
 
         if (status === WagerTransactionStatus.Processed) {
-            transaction.markProcessed(undefined, new Date());
+            transaction.markProcessed(
+                undefined,
+                new Date(),
+                Money.from({
+                    amount: '75.00',
+                    currency: 'BRL',
+                }),
+            );
         } else if (status === WagerTransactionStatus.Rejected) {
             transaction.reject(FailureCode.InsufficientBalance);
         } else {
@@ -193,7 +221,14 @@ describe('WagerTransaction', () => {
         expect(transaction.isTerminal()).toBe(true);
 
         expect(() =>
-            transaction.markProcessed(undefined, new Date()),
+            transaction.markProcessed(
+                undefined,
+                new Date(),
+                Money.from({
+                amount: '75.00',
+                currency: 'BRL',
+                }),
+            ),
         ).toThrow(InvalidTransactionStateError);
 
         expect(() => transaction.markPendingReference()).toThrow(
@@ -221,6 +256,10 @@ describe('WagerTransaction', () => {
             status: WagerTransactionStatus.Processed,
             referenceTransactionId: 'internal-original',
             processedAt,
+            resultBalance: Money.from({
+                amount: '75.00',
+                currency: 'BRL',
+            }),
         });
 
         expect(transaction.status).toBe(WagerTransactionStatus.Processed);
@@ -239,6 +278,7 @@ describe('WagerTransaction', () => {
         expect(() =>
             transaction.reject(FailureCode.InvalidReference),
         ).toThrow(InvalidTransactionStateError);
+        expect(transaction.getProcessedResult().balance.amount).toBe('75.00',);
     });
 
     test.each([
@@ -275,7 +315,14 @@ describe('WagerTransaction', () => {
         expect(transaction.processedAt).toBeUndefined();
 
         // Pode continuar o processamento quando a referência for resolvida.
-        transaction.markProcessed('internal-original', new Date());
+        transaction.markProcessed(
+            'internal-original',
+            new Date(),
+            Money.from({
+                amount: '75.00',
+                currency: 'BRL',
+            }),
+        );
 
         expect(transaction.status).toBe(WagerTransactionStatus.Processed);
     });
@@ -291,6 +338,10 @@ describe('WagerTransaction', () => {
             ...props,
             status: WagerTransactionStatus.Processed,
             processedAt,
+            resultBalance: Money.from({
+                amount: '75.00',
+                currency: 'BRL',
+            }),
         });
 
         // Tenta modificar as datas fornecidas na entrada.

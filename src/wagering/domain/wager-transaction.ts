@@ -4,7 +4,7 @@ export enum WagerTransactionKind {
     Opening = 'OPENING',
     Bet = 'BET',
     Win = 'WIN',
-    Loss = 'Loss',
+    Loss = 'LOSS',
     Refund = 'REFUND',
     Rollback = 'ROLLBACK',
 }
@@ -33,6 +33,7 @@ export interface WagerTransactionState extends CreateWagerTransactionProps {
     referenceTransactionId?: string;
     failureCode?: FailureCode;
     processedAt?: Date;
+    resultBalance?: Money;
 }
 
 export class InvalidTransactionStateError extends Error {
@@ -70,6 +71,7 @@ export class WagerTransaction {
     private _referenceTransactionId: string | undefined;
     private _failureCode: FailureCode | undefined;
     private _processedAt: Date | undefined;
+    private _resultBalance: Money | undefined;
 
     private constructor(
         // IDENTIDADE INTERNA:
@@ -130,7 +132,7 @@ export class WagerTransaction {
         if (
             props.referenceExternalTransactionId !== undefined &&
             (
-                typeof props.externalTransactionId !== 'string' ||
+                typeof props.referenceExternalTransactionId !== 'string' ||
                 props.referenceExternalTransactionId.trim() === ''
             )
         ) {
@@ -197,6 +199,8 @@ export class WagerTransaction {
                 ? undefined
                 : new Date(state.processedAt.getTime());
 
+        transaction._resultBalance = state.resultBalance;
+
         return transaction;
     }
 
@@ -230,7 +234,7 @@ export class WagerTransaction {
 
     // TRANSIÇÃO: confirma o processamento.
     // Recebe o identificador interno da referência, quando existir.
-    markProcessed(referenceTransactionId: string | undefined, at: Date): void {
+    markProcessed(referenceTransactionId: string | undefined, at: Date, resultBalance: Money): void {
         this.assertNotTerminal();
 
         if (
@@ -251,11 +255,20 @@ export class WagerTransaction {
             throw new InvalidWagerTransactionError('A data de processamento deve ser válida.',);
         }
 
+        if (resultBalance.currency !== this.money.currency) {
+            throw new InvalidWagerTransactionError('A moeda do saldo resultante deve corresponder à transação.',);
+        }
+
+        if (resultBalance.isNegative()) {
+            throw new InvalidWagerTransactionError('O saldo resultante não pode ser negativo.',);
+        }
+
         // Copia e valida antes de modificar o estado.
         const processedAt = new Date(at.getTime());
 
         this._referenceTransactionId = referenceTransactionId;
         this._processedAt = processedAt;
+        this._resultBalance = resultBalance;
         this._status = WagerTransactionStatus.Processed;
     }
 
@@ -310,5 +323,26 @@ export class WagerTransaction {
         return this._processedAt === undefined
         ? undefined
         : new Date(this._processedAt.getTime());
+    }
+
+    get resultBalance(): Money | undefined {
+        return this._resultBalance;
+    }
+
+    // CONSULTA DO RESULTADO ORIGINAL:
+    // Não recebe Wallet e não consulta seu saldo atual.
+    getProcessedResult() {
+        if (
+            this._status !== WagerTransactionStatus.Processed ||
+            this._resultBalance === undefined
+        ) {
+            throw new InvalidWagerTransactionError('A transação não possui um resultado processado disponível.',);
+        }
+
+        return {
+            transactionId: this.id,
+            status: WagerTransactionStatus.Processed,
+            balance: this._resultBalance.toJSON(),
+        };
     }
 }
