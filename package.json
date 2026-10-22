@@ -14,14 +14,16 @@
     "lint": "oxlint --type-aware src/ test/",
     "test:clean": "bun -e \"require('node:fs').rmSync('dist-test', { recursive: true, force: true })\"",
     "test:build": "bun run test:clean && tsc -p tsconfig.test.json",
-    "test": "bun run test:build && bun test",
+    "test": "bun run test:unit",
     "test:unit": "bun run test:build && bun test ./dist-test/src",
     "test:e2e": "bun run test:build && bun test ./dist-test/test",
     "test:cov": "bun run test:build && bun test --coverage",
     "db:debug": "bun run --bun mikro-orm debug --config ./src/database/mikro-orm.config.ts",
     "db:migration:create": "bun run --bun mikro-orm migration:create --config ./src/database/mikro-orm.config.ts",
     "db:migration:up": "bun run --bun mikro-orm migration:up --config ./src/database/mikro-orm.config.ts",
-    "db:migration:list": "bun run --bun mikro-orm migration:list --config ./src/database/mikro-orm.config.ts"
+    "db:migration:list": "bun run --bun mikro-orm migration:list --config ./src/database/mikro-orm.config.ts",
+    "test:integration": "bun run test:build && bun test ./dist-test/test/wallets.integration.spec.js",
+    "db:test:prepare": "bun ./scripts/prepare-test-database.ts"
   },
   "dependencies": {
     "@mikro-orm/core": "7.2",

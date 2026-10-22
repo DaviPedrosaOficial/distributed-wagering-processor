@@ -1,37 +1,42 @@
-import 'reflect-metadata';
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
-import { Test, TestingModule } from '@nestjs/testing';
-import { INestApplication } from '@nestjs/common';
-import request from 'supertest';
-import { App } from 'supertest/types.js';
-import { AppModule } from './../src/app.module.js';
-import { MikroORM } from '@mikro-orm/core';
+import "reflect-metadata";
+import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { Test, TestingModule } from "@nestjs/testing";
+import { INestApplication } from "@nestjs/common";
+import request from "supertest";
+import { App } from "supertest/types.js";
+import { MikroOrmModule } from "@mikro-orm/nestjs";
+import { AppController } from "../src/app.controller.js";
+import { AppService } from "../src/app.service.js";
+import { integrationConfig } from "./integration-config.js";
+import { MikroORM } from "@mikro-orm/core";
 
-describe('AppController (e2e)', () => {
+describe("AppController (e2e)", () => {
   let app: INestApplication<App>;
 
   beforeEach(async () => {
     const moduleFixture: TestingModule = await Test.createTestingModule({
-      imports: [AppModule],
+      imports: [MikroOrmModule.forRoot(integrationConfig())],
+      controllers: [AppController],
+      providers: [AppService],
     }).compile();
 
     app = moduleFixture.createNestApplication();
     await app.init();
   });
 
-  it('/ (GET)', () => {
+  it("/ (GET)", () => {
     return request(app.getHttpServer())
-      .get('/')
+      .get("/")
       .expect(200)
-      .expect('Hello World!');
+      .expect("Hello World!");
   });
 
-  it('deve executar uma consulta no PostgreSQL', async () => {
+  it("deve executar uma consulta no PostgreSQL", async () => {
     const orm = app.get(MikroORM);
 
-    const result = await orm.em.getConnection().execute(
-      'SELECT 1 AS connected',
-    );
+    const result = await orm.em
+      .getConnection()
+      .execute("SELECT 1 AS connected");
 
     expect(result).toEqual([{ connected: 1 }]);
   });
