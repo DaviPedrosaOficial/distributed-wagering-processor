@@ -1,0 +1,29 @@
+import { Body, Controller, Headers, Post, Res } from "@nestjs/common";
+import type { Response } from "express";
+import { randomUUID } from "node:crypto";
+import { ProcessTransactionService } from "../application/process-transaction.service.js";
+import { WagerTransactionStatus } from "../domain/wager-transaction.js";
+import { SubmitTransactionDto } from "./submit-transaction.dto.js";
+
+@Controller("wagering/transactions")
+export class WageringController {
+  constructor(private readonly service: ProcessTransactionService) {}
+  @Post()
+  async submit(
+    @Body() body: SubmitTransactionDto,
+    @Headers("idempotency-key") key: string,
+    @Headers("x-correlation-id") correlation: string | undefined,
+    @Res({ passthrough: true }) response: Response,
+  ) {
+    const correlationId =
+      correlation && /^[A-Za-z0-9:_-]{1,128}$/.test(correlation)
+        ? correlation
+        : randomUUID();
+    const result = await this.service.execute(body, key, correlationId);
+    response.status(
+      result.status === WagerTransactionStatus.Rejected ? 422 : 200,
+    );
+    response.setHeader("X-Correlation-Id", correlationId);
+    return result;
+  }
+}

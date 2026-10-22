@@ -47,7 +47,7 @@ Na persistência, valor e moeda ocupam colunas separadas. `DecimalType('string')
 preserva a representação textual ao atravessar o ORM. O mapper reconstrói Money
 antes de entregar valores ao domínio.
 
-## 3. Abertura financeira e unidade transacional
+## 3. Abertura, processamento e unidade transacional
 
 Wallet concentra as regras de saldo. Créditos e débitos exigem valor positivo e
 moeda compatível; débitos sem saldo são rejeitados. Cada movimentação valida seu
@@ -71,9 +71,29 @@ O trade-off é que a abertura depende de todas essas gravações, inclusive da
 outbox. Aceitei esse custo para não confirmar dados financeiros sem registrar
 os eventos correspondentes. Nenhuma chamada a serviço externo ocorre nesse fluxo.
 
-Essa estratégia foi validada para a abertura. Não há ainda estratégia implementada
-de bloqueio ou retry para movimentações concorrentes de uma carteira existente.
-A versão, sozinha, não constitui optimistic locking.
+ProcessTransactionService aplica BET, WIN e LOSS. BET debita, WIN credita e LOSS
+registra o resultado sem alterar saldo ou gerar ledger. BET e WIN exigem valor
+positivo. LOSS aceita zero ou valor positivo, mas nunca movimenta esse valor.
+Jogador e carteira precisam corresponder; moeda incompatível e saldo insuficiente
+produzem rejeições persistidas, sem movimentação.
+
+Para carteiras existentes, adotei `LockMode.PESSIMISTIC_WRITE` dentro da transação
+SQL, antes da leitura utilizada no cálculo. O PostgreSQL bloqueia a linha da
+carteira até commit ou rollback. Uma segunda execução sobre a mesma carteira
+aguarda e utiliza o saldo confirmado pela anterior. Carteiras distintas não
+compartilham esse bloqueio de linha; não há mutex global em memória.
+
+Escolhi o bloqueio pessimista pela simplicidade de serializar a disputa pelo
+saldo no banco. O custo é a espera e o uso de conexões durante a contenção; por
+isso não faço chamadas externas dentro da transação. A versão é um contador de
+mudanças de saldo, não um mecanismo de optimistic locking. LOSS, rejeição e replay
+não a incrementam. Não há retry automático implementado para falhas de bloqueio.
+
+Transação externa, atualização da carteira, ledger e outbox também são atômicos.
+O primeiro flush grava a transação já processada ou rejeitada, permitindo que o
+trigger do ledger encontre seu estado. O segundo envia as demais gravações.
+Ambos ocorrem antes do commit: uma falha posterior reverte inclusive o primeiro
+flush. A resposta só sai após a conclusão de transactional().
 
 ## 4. Garantias no PostgreSQL e imutabilidade do ledger
 
@@ -133,8 +153,9 @@ Os códigos declarados em FailureCode são:
 
 reject() registra rejeição de negócio; fail() registra falha permanente. Ambos
 validam a existência do código no enum, mas ainda não restringem seus membros por
-categoria. A classificação integrada, a resolução de referências e a política de
-espera/reprocessamento não estão implementadas. O código REFERENCE_NOT_FOUND não
+categoria. O fluxo atual utiliza INSUFFICIENT_BALANCE e CURRENCY_MISMATCH nas rejeições.
+A resolução de referências e a política de espera/reprocessamento não estão
+implementadas. O código REFERENCE_NOT_FOUND não
 significa que já exista um worker ou um limite de tentativas definido.
 
 ## 6. Resultado histórico e identidade da operação
@@ -152,16 +173,41 @@ Para OPENING, defini a identidade `opening:<walletId>` e a chave
 na ordem fixa amount, currency, kind, playerId e walletId, com valores monetários
 serializados como strings. Essa convenção é específica da operação interna.
 
-As unicidades do banco e o resultado histórico preparam a integração com
-idempotência, mas não implementam replay completo. A canonicalização de payloads
-externos, sua comparação e a devolução de respostas repetidas ainda não existem.
+Para operações externas, Idempotency-Key é obrigatório, não vazio e limitado a
+255 caracteres. O serviço procura pela chave ou por (providerId,
+externalTransactionId). O replay exige um único registro, a mesma chave e o mesmo
+payloadHash; conteúdo diferente ou identidade externa reutilizada com outra chave
+produzem conflito. Não utilizo cache em memória como garantia.
 
-## 7. Eventos e outbox da abertura
+O hash externo é SHA-256 hexadecimal sobre o JSON em UTF-8 de campos explícitos:
+externalTransactionId, gameId, kind, money, playerId, providerId, referência externa
+quando presente, roundId e walletId. As chaves do objeto principal são ordenadas;
+money é construído na ordem amount, currency. Isso ordena ambos os níveis do
+contrato atual. Idempotency-Key e metadados de transporte ficam fora. As strings
+são comparadas conforme recebidas, sem normalização Unicode ou remoção de espaços.
+Essa canonicalização é específica deste contrato, não um algoritmo JSON genérico.
+
+O serviço devolve result_balance da operação processada, sem consultar o saldo
+atual. Uma aposta que deixou 75.00 continua retornando 75.00 após um prêmio levar
+a carteira a 115.00. Apenas idempotentReplay muda para true. Rejeições também são
+repetidas com o resultado registrado; saldo posterior não as transforma em sucesso.
+
+O bloqueio por carteira serializa as repetições sobre a mesma carteira. Para
+colisões de chave entre carteiras distintas, as restrições UNIQUE decidem a
+vencedora. A execução perdedora sofre rollback e consulta o registro confirmado
+com outro EntityManager, pois a transação abortada não pode ser reutilizada.
+
+## 7. Eventos e outbox
 
 Decidi persistir WagerTransactionProcessed e WalletBalanceChanged junto da abertura
 positiva. Cada um possui uma classe concreta com eventType e versão `1`, baseada
 em IntegrationEvent. O envelope contém eventId, aggregateId, correlationId,
 causationId, occurredAt e data.
+
+No processamento externo, BET e WIN geram WagerTransactionProcessed e
+WalletBalanceChanged; LOSS gera somente WagerTransactionProcessed. Rejeições
+geram WagerTransactionRejected, incluindo um failureCode estável. Replay não cria
+novos eventos nem lançamentos.
 
 A serialização usa datas ISO e MoneyProps, sem instâncias de Money. Cópias dos
 dados isolam o envelope dos objetos externos. A versão do evento identifica seu
@@ -174,7 +220,7 @@ Em contrapartida, a comunicação com outros serviços não ocorre imediatamente
 Ainda não existe publisher SQS, coordenação entre publishers ou recuperação de
 publicações. Persistir eventos pendentes não comprova entrega distribuída.
 
-## 8. Contrato HTTP da carteira
+## 8. Contratos HTTP e classificação dos resultados
 
 DTOs validam UUID, formato monetário e campos permitidos. A validação de entrada
 complementa as regras de Money; não as substitui. O filtro traduz os erros
@@ -195,20 +241,50 @@ prévia, isoladamente, não impediria duas inserções concorrentes.
 O X-Correlation-Id é aceito dentro do formato limitado do controller ou substituído
 por um UUID gerado. Esse identificador correlaciona os eventos; não é chave de
 idempotência nem autorização. Os endpoints atuais não possuem autenticação.
-O tratamento HTTP dos demais fluxos ainda não está definido.
+POST /wagering/transactions aceita BET, WIN e LOSS. OPENING é exclusivamente
+interno e o identificador de provedor __internal__ é reservado. REFUND, ROLLBACK e
+pedidos com referência externa ainda são recusados explicitamente como entrada
+não suportada, inclusive WIN com referência. Não são aceitos como pendências.
+
+| Situação no processamento externo | HTTP |
+| --- | --- |
+| Operação processada ou replay processado | 200 |
+| Payload, valor ou chave inválidos; recurso não suportado | 400 |
+| Carteira inexistente | 404 |
+| Conflito de idempotência ou identidade externa | 409 |
+| Rejeição financeira persistida ou seu replay | 422 |
+| Falha transitória de banco reconhecida | 503 |
+| Falha inesperada | 500 |
+
+O serviço traduz exceções de conexão e os SQLSTATE 40001, 40P01, 55P03, 57014,
+57P01, 57P02 e 57P03 em TRANSIENT_DATABASE_FAILURE. Erros inesperados são
+propagados e provocam rollback. Esse tratamento ainda é local ao processamento,
+não uma política global aplicada a todos os endpoints. A API ainda não oferece
+um fluxo de aceite pendente. Autenticação e seu ponto de extensão continuam
+pendentes; verificar o playerId não comprova a identidade de quem chama a API.
 
 ## 9. Validação e limites conhecidos
 
-Build e lint passaram. Foram aprovados 100 testes unitários e 20 testes HTTP/SQL
-no ambiente local com PostgreSQL 17 em Docker.
+Build e lint passaram sem avisos. Foram aprovados 103 testes unitários e 31
+testes HTTP/SQL no ambiente local com PostgreSQL 17 em Docker.
 
 A suíte integrada verifica up/down das migrations, abertura positiva e zero,
-versão inicial, duplicidade, precisão monetária, consulta, resultado histórico,
-restrições SQL e rollback quando a outbox falha. O banco indicado por
-POSTGRES_TEST_DB é separado e deve terminar em _test, pois a suíte reverte e
-reaplica migrations nele.
+versão inicial, duplicidade, precisão monetária, consulta e restrições SQL.
+No processamento, cobre BET, WIN, LOSS, replay histórico, conflitos e rejeições,
+além de rollback quando a outbox falha após o primeiro flush.
 
-Essa validação cobre a abertura financeira. Processamento externo de apostas,
-replay completo, concorrência entre múltiplas instâncias, referências fora de
-ordem, inbox, publicação/consumo SQS, reconciliação e observabilidade operacional
-ainda não foram concluídos. Não há alegação de atendimento integral do desafio.
+Os cenários concorrentes executados incluem duas apostas de 80.00 disputando
+100.00, cinquenta pedidos simultâneos da mesma operação e uma chave disputada
+entre carteiras. Confirmam um único débito quando aplicável. São requisições
+concorrentes à mesma aplicação de teste; ainda não comprovam o cenário exigido
+com três ou mais processos independentes.
+
+O banco indicado por POSTGRES_TEST_DB é separado e deve terminar em _test,
+pois a suíte reverte e reaplica migrations nele. Não há sincronização automática
+do schema nem alterações novas de migration neste bloco de processamento.
+
+Referências fora de ordem, REFUND, ROLLBACK, inbox, publicação/consumo SQS,
+recuperação após interrupção de workers, consultas de ledger/transações,
+reconciliação, health checks e observabilidade operacional ainda estão pendentes.
+As decisões de TTL/backoff de referências e coordenação de publishers não foram
+tomadas. Não há alegação de atendimento integral do desafio.

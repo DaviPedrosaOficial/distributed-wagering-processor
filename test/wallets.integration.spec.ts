@@ -1,4 +1,5 @@
 import "reflect-metadata";
+import { WageringModule } from "../src/wagering/wagering.module.js";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { Test } from "@nestjs/testing";
 import type { INestApplication } from "@nestjs/common";
@@ -13,11 +14,14 @@ import { WalletLedgerRecord } from "../src/database/entities/wallet-ledger.recor
 import { WagerTransactionRecord } from "../src/database/entities/wager-transaction.record.js";
 import { OutboxRecord } from "../src/database/entities/outbox.record.js";
 import { transactionFromRecord } from "../src/database/mappers/financial-records.mapper.js";
-import { WagerTransactionKind, WagerTransactionStatus, } from "../src/wagering/domain/wager-transaction.js";
+import {
+  WagerTransactionKind,
+  WagerTransactionStatus,
+} from "../src/wagering/domain/wager-transaction.js";
 import { LedgerDirection } from "../src/wallets/domain/wallet-ledger-entry.js";
 import { OpenWalletService } from "../src/wallets/application/open-wallet.service.js";
 
-describe("Abertura de carteira (integração PostgreSQL)", () => {
+describe("Carteiras e operações (integração PostgreSQL)", () => {
   let app: INestApplication;
   let orm: MikroORM;
   const body = (
@@ -38,7 +42,11 @@ describe("Abertura de carteira (integração PostgreSQL)", () => {
 
   beforeAll(async () => {
     const module = await Test.createTestingModule({
-      imports: [MikroOrmModule.forRoot(integrationConfig()), WalletsModule],
+      imports: [
+        MikroOrmModule.forRoot(integrationConfig()),
+        WalletsModule,
+        WageringModule,
+      ],
     }).compile();
     app = module.createNestApplication();
     app.useLogger(false);
@@ -279,5 +287,237 @@ describe("Abertura de carteira (integração PostgreSQL)", () => {
       .fork()
       .findOneOrFail(WagerTransactionRecord, { walletId: response.body.id });
     expect(record.resultBalance).toBe("100.00");
+  });
+  const open = async () => {
+    const playerId = randomUUID();
+    const response = await api()
+      .post("/wallets")
+      .send(body(playerId))
+      .expect(201);
+    return { playerId, walletId: response.body.id as string };
+  };
+  const operation = (
+    wallet: { playerId: string; walletId: string },
+    kind = "BET",
+    amount = "25.00",
+  ) => ({
+    ...wallet,
+    providerId: "provider-a",
+    externalTransactionId: randomUUID(),
+    gameId: "game-1",
+    roundId: "round-1",
+    kind,
+    money: { amount, currency: "BRL" },
+  });
+  const submit = (
+    input: ReturnType<typeof operation>,
+    key = `provider-a:${input.externalTransactionId}`,
+  ) =>
+    api()
+      .post("/wagering/transactions")
+      .set("Idempotency-Key", key)
+      .send(input);
+
+  test("BET debita, WIN credita e LOSS preserva saldo e versão", async () => {
+    const wallet = await open();
+    const bet = await submit(operation(wallet)).expect(200);
+    expect(bet.body.balance.amount).toBe("75.00");
+    const win = await submit(operation(wallet, "WIN", "40.00")).expect(200);
+    expect(win.body.balance.amount).toBe("115.00");
+    const loss = await submit(operation(wallet, "LOSS", "0.00")).expect(200);
+    expect(loss.body.balance.amount).toBe("115.00");
+    const saved = await orm.em
+      .fork()
+      .findOneOrFail(WalletRecord, { id: wallet.walletId });
+    expect(saved.version).toBe(3);
+    expect(
+      await orm.em
+        .fork()
+        .count(WalletLedgerRecord, { walletId: wallet.walletId }),
+    ).toBe(3);
+    expect(
+      await orm.em.fork().count(OutboxRecord, { aggregateId: wallet.walletId }),
+    ).toBe(7);
+  });
+
+  test("replay devolve o saldo histórico depois de outra movimentação", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    const original = await submit(input).expect(200);
+    await submit(operation(wallet, "WIN", "40.00")).expect(200);
+    const replay = await submit(input).expect(200);
+    expect(replay.body).toEqual({ ...original.body, idempotentReplay: true });
+    expect(replay.body.balance.amount).toBe("75.00");
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("115.00");
+  });
+
+  test("chave repetida com conteúdo diferente e identidade externa com outra chave conflitam", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    await submit(input, "same-key").expect(200);
+    await submit(
+      { ...input, money: { amount: "30.00", currency: "BRL" } },
+      "same-key",
+    ).expect(409);
+    await submit(input, "different-key").expect(409);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("75.00");
+  });
+
+  test("rejeição por saldo insuficiente fica auditável e também é idempotente", async () => {
+    const wallet = await open();
+    const input = operation(wallet, "BET", "150.00");
+    const original = await submit(input).expect(422);
+    expect(original.body.failureCode).toBe("INSUFFICIENT_BALANCE");
+    await submit(operation(wallet, "WIN", "100.00")).expect(200);
+    const replay = await submit(input).expect(422);
+    expect(replay.body).toEqual({ ...original.body, idempotentReplay: true });
+    expect(
+      await orm.em.fork().count(WalletLedgerRecord, {
+        transactionId: original.body.transactionId,
+      }),
+    ).toBe(0);
+  });
+
+  test("rejeita moeda divergente sem tocar saldo ou ledger", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    input.money.currency = "USD";
+    const result = await submit(input).expect(422);
+    expect(result.body.failureCode).toBe("CURRENCY_MISMATCH");
+    expect((await api().get(`/wallets/${wallet.walletId}`)).body.version).toBe(
+      1,
+    );
+  });
+
+  test("valida header, OPENING externo, valor zero, identidade e referência não implementada", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    await api().post("/wagering/transactions").send(input).expect(400);
+    await submit({ ...input, kind: "OPENING" }).expect(400);
+    await submit(operation(wallet, "BET", "0.00")).expect(400);
+    await submit({ ...input, playerId: randomUUID() }).expect(400);
+    await submit({
+      ...input,
+      referenceExternalTransactionId: "unknown",
+    } as ReturnType<typeof operation>).expect(400);
+  });
+
+  test("duas apostas simultâneas de 80 disputam saldo de 100 sem lost update", async () => {
+    const wallet = await open();
+    const results = await Promise.all([
+      submit(operation(wallet, "BET", "80.00")),
+      submit(operation(wallet, "BET", "80.00")),
+    ]);
+    expect(results.map((r) => r.status).sort((a, b) => a - b)).toEqual([
+      200, 422,
+    ]);
+    const saved = await orm.em
+      .fork()
+      .findOneOrFail(WalletRecord, { id: wallet.walletId });
+    expect(saved.balance).toBe("20.00");
+    expect(saved.version).toBe(2);
+    expect(
+      await orm.em.fork().count(WalletLedgerRecord, {
+        walletId: wallet.walletId,
+        direction: LedgerDirection.Debit,
+      }),
+    ).toBe(1);
+  });
+
+  test("50 envios simultâneos da mesma operação debitam somente uma vez", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    const results = await Promise.all(
+      Array.from({ length: 50 }, () => submit(input)),
+    );
+    expect(results.every((r) => r.status === 200)).toBe(true);
+    expect(new Set(results.map((r) => r.body.transactionId)).size).toBe(1);
+    expect(
+      results.filter((r) => r.body.idempotentReplay === false),
+    ).toHaveLength(1);
+    expect(
+      await orm.em.fork().count(WalletLedgerRecord, {
+        walletId: wallet.walletId,
+        direction: LedgerDirection.Debit,
+      }),
+    ).toBe(1);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("75.00");
+  }, 30000);
+
+  test("mesma chave disputada entre carteiras reverte a operação perdedora", async () => {
+    const wallets = await Promise.all([open(), open()]);
+    const key = randomUUID();
+    const results = await Promise.all(
+      wallets.map((w) => submit(operation(w), key)),
+    );
+    expect(results.map((r) => r.status).sort((a, b) => a - b)).toEqual([
+      200, 409,
+    ]);
+    const balances = await Promise.all(
+      wallets.map((w) => api().get(`/wallets/${w.walletId}`)),
+    );
+    expect(
+      balances
+        .map((r) => String(r.body.balance.amount))
+        .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
+    ).toEqual(["100.00", "75.00"]);
+  });
+  test("falha na outbox desfaz débito, ledger e transação mesmo após o primeiro flush", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    const connection = orm.em.getConnection();
+    await connection.execute(
+      `create function fail_wager_outbox() returns trigger language plpgsql as $$ begin raise exception 'Falha simulada'; end; $$;`,
+    );
+    await connection.execute(
+      `create trigger fail_wager_outbox before insert on outbox_messages for each row execute function fail_wager_outbox();`,
+    );
+    try {
+      await submit(input).expect(500);
+      const saved = await orm.em
+        .fork()
+        .findOneOrFail(WalletRecord, { id: wallet.walletId });
+      expect(saved.balance).toBe("100.00");
+      expect(saved.version).toBe(1);
+      expect(
+        await orm.em
+          .fork()
+          .count(WagerTransactionRecord, {
+            externalTransactionId: input.externalTransactionId,
+          }),
+      ).toBe(0);
+      expect(
+        await orm.em
+          .fork()
+          .count(WalletLedgerRecord, { walletId: wallet.walletId }),
+      ).toBe(1);
+      expect(
+        await orm.em
+          .fork()
+          .count(OutboxRecord, { aggregateId: wallet.walletId }),
+      ).toBe(2);
+    } finally {
+      await connection.execute(
+        `drop trigger fail_wager_outbox on outbox_messages;`,
+      );
+      await connection.execute(`drop function fail_wager_outbox();`);
+    }
+    await submit(input).expect(200);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("75.00");
+  });
+
+  test("permite consumir todo saldo e rejeita carteira inexistente", async () => {
+    const wallet = await open();
+    const input = operation(wallet, "BET", "100.00");
+    expect((await submit(input).expect(200)).body.balance.amount).toBe("0.00");
+    await submit(operation({ ...wallet, walletId: randomUUID() })).expect(404);
   });
 });

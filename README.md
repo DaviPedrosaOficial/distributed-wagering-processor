@@ -20,11 +20,14 @@ Docker Compose.
 - Abertura e consulta de carteiras pela API HTTP.
 - Abertura positiva com OPENING, ledger e eventos da outbox no mesmo commit,
   preservando a versão inicial `1`.
-- Resultado histórico persistido e restrições de integridade no PostgreSQL.
+- Processamento HTTP de BET, WIN e LOSS com bloqueio de linha por carteira.
+- Idempotência persistida, comparação de payload e replay do resultado histórico.
+- Saldo, transação, ledger e outbox gravados atomicamente, com rejeições auditáveis.
+- Restrições de integridade no PostgreSQL.
 
-O projeto está em desenvolvimento. Processamento de apostas externas, replay
-completo, concorrência das movimentações, integração SQS e reconciliação ainda
-não estão concluídos. Os eventos da outbox são armazenados, mas ainda não publicados.
+O projeto está em desenvolvimento. Referências, REFUND, ROLLBACK, integração SQS,
+consultas de ledger/transações, reconciliação e validação com múltiplos processos
+ainda estão pendentes. Os eventos da outbox são armazenados, mas ainda não publicados.
 A API atual não possui autenticação.
 
 ## Executar localmente
@@ -46,6 +49,7 @@ Confira as variáveis do `.env` antes da execução. Por padrão, a API atende e
 | --- | --- | --- |
 | POST | /wallets | Abrir carteira |
 | GET | /wallets/:walletId | Consultar carteira |
+| POST | /wagering/transactions | Processar BET, WIN ou LOSS |
 
 Exemplo de corpo para criação:
 
@@ -55,6 +59,11 @@ Exemplo de corpo para criação:
   "initialBalance": { "amount": "100.00", "currency": "BRL" }
 }
 ```
+
+A submissão de operações exige o header `Idempotency-Key`. Uma repetição idêntica
+retorna o resultado original com `idempotentReplay: true`; conteúdo diferente com
+a mesma chave gera 409. Rejeições financeiras retornam 422. Referências e estornos
+ainda são recusados explicitamente.
 
 ## Validar
 
@@ -75,11 +84,12 @@ bun run test:e2e
 **Use um banco separado terminado em `_test`: a suíte reverte e reaplica as
 migrations, removendo os dados desse banco de testes.**
 
-Validação realizada: **100 testes unitários e 20 testes HTTP/SQL aprovados**, com
+Validação realizada: **103 testes unitários e 31 testes HTTP/SQL aprovados**, com
 PostgreSQL 17 em Docker, além de build e lint sem erros.
 
 As decisões, justificativas e limitações estão em
 [ARCHITECTURE.md](ARCHITECTURE.md). O passo a passo da abertura e dos comandos
-está em [GUIA-ABERTURA.md](GUIA-ABERTURA.md).
+está em [GUIA-ABERTURA.md](GUIA-ABERTURA.md); o processamento externo é explicado
+em [GUIA-TRANSACOES.md](GUIA-TRANSACOES.md).
 
 Desafio de referência: [Jungle Gaming — Backend Challenge](https://github.com/junglegaming/backend-challenge).
