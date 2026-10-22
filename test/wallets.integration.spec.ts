@@ -1,4 +1,45 @@
 import "reflect-metadata";
+import { MessagingModule } from "../src/messaging/messaging.module.js";
+import { InboxRecord } from "../src/database/entities/inbox.record.js";
+import { QueuePort, type QueueDelivery, } from "../src/messaging/application/queue.port.js";
+import { WagerConsumerWorker } from "../src/messaging/application/wager-consumer.worker.js";
+import { OutboxPublisherWorker } from "../src/messaging/application/outbox-publisher.worker.js";
+
+class RecordingQueue extends QueuePort {
+  sent: Array<{ queue: string; body: string; deduplicationId: string }> = [];
+  acknowledgements = 0;
+  delays: number[] = [];
+  failPublish = false;
+  failAck = false;
+  async receive(
+    _queue?: string,
+    _wait?: number,
+    _signal?: AbortSignal,
+  ): Promise<QueueDelivery[]> {
+    return [];
+  }
+  async publish(
+    queue: string,
+    body: string,
+    _group: string,
+    deduplicationId: string,
+  ): Promise<void> {
+    if (this.failPublish) throw new Error("Broker indisponível");
+    this.sent.push({ queue, body, deduplicationId });
+  }
+  async acknowledge(): Promise<void> {
+    if (this.failAck) throw new Error("Ack falhou");
+    this.acknowledgements++;
+  }
+  async visibility(
+    _queue: string,
+    _receipt: string,
+    seconds: number,
+  ): Promise<void> {
+    this.delays.push(seconds);
+  }
+}
+
 import { ProcessTransactionService } from "../src/wagering/application/process-transaction.service.js";
 import { ReferenceRetryWorker } from "../src/wagering/application/reference-retry.worker.js";
 import { ReferenceScheduleRecord } from "../src/database/entities/reference-schedule.record.js";
@@ -17,11 +58,15 @@ import { WalletLedgerRecord } from "../src/database/entities/wallet-ledger.recor
 import { WagerTransactionRecord } from "../src/database/entities/wager-transaction.record.js";
 import { OutboxRecord } from "../src/database/entities/outbox.record.js";
 import { transactionFromRecord } from "../src/database/mappers/financial-records.mapper.js";
-import { WagerTransactionKind, WagerTransactionStatus, } from "../src/wagering/domain/wager-transaction.js";
+import {
+  WagerTransactionKind,
+  WagerTransactionStatus,
+} from "../src/wagering/domain/wager-transaction.js";
 import { LedgerDirection } from "../src/wallets/domain/wallet-ledger-entry.js";
 import { OpenWalletService } from "../src/wallets/application/open-wallet.service.js";
 
 process.env.REFERENCE_WORKER_ENABLED = "false";
+process.env.MESSAGING_ENABLED = "false";
 
 describe("Carteiras e operações (integração PostgreSQL)", () => {
   let app: INestApplication;
@@ -48,6 +93,7 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
         MikroOrmModule.forRoot(integrationConfig()),
         WalletsModule,
         WageringModule,
+        MessagingModule,
       ],
     }).compile();
     app = module.createNestApplication();
@@ -66,7 +112,7 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
 
   test("deve aplicar e reverter migrations sem pendências", async () => {
     expect(await orm.migrator.getPending()).toHaveLength(0);
-    expect(await orm.migrator.getExecuted()).toHaveLength(3);
+    expect(await orm.migrator.getExecuted()).toHaveLength(4);
   });
 
   test("deve salvar carteira, OPENING, ledger e dois eventos com versão 1", async () => {
@@ -867,18 +913,14 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
         "PENDING_REFERENCE",
       );
       expect(
-        await orm.em
-          .fork()
-          .count(ReferenceScheduleRecord, {
-            transactionId: pending.body.transactionId,
-          }),
+        await orm.em.fork().count(ReferenceScheduleRecord, {
+          transactionId: pending.body.transactionId,
+        }),
       ).toBe(1);
       expect(
-        await orm.em
-          .fork()
-          .count(WalletLedgerRecord, {
-            transactionId: pending.body.transactionId,
-          }),
+        await orm.em.fork().count(WalletLedgerRecord, {
+          transactionId: pending.body.transactionId,
+        }),
       ).toBe(0);
     } finally {
       await connection.execute(
@@ -890,5 +932,356 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
       .get(ProcessTransactionService)
       .retryPending(pending.body.transactionId, schedule.expiresAt);
     await submit(input).expect(422);
+  });
+  const delivery = (
+    input: ReturnType<typeof operation>,
+    messageId = randomUUID(),
+  ): QueueDelivery => ({
+    brokerMessageId: randomUUID(),
+    receiptHandle: randomUUID(),
+    receiveCount: 1,
+    body: JSON.stringify({
+      messageId,
+      type: "WagerTransactionRequested",
+      occurredAt: new Date().toISOString(),
+      data: {
+        ...input,
+        idempotencyKey: `provider-a:${input.externalTransactionId}`,
+      },
+    }),
+  });
+  test("inbox e efeito financeiro são confirmados juntos; redelivery não repete débito", async () => {
+    const wallet = await open();
+    const item = delivery(operation(wallet));
+    const broker = new RecordingQueue();
+    const consumer = new WagerConsumerWorker(
+      broker,
+      app.get(ProcessTransactionService),
+    );
+    await consumer.handle(item);
+    await consumer.handle({
+      ...item,
+      receiptHandle: randomUUID(),
+      receiveCount: 2,
+    });
+    expect(broker.acknowledgements).toBe(2);
+    expect(await orm.em.fork().count(InboxRecord, {})).toBe(1);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("75.00");
+    expect(
+      await orm.em.fork().count(WalletLedgerRecord, {
+        walletId: wallet.walletId,
+        direction: LedgerDirection.Debit,
+      }),
+    ).toBe(1);
+  });
+  test("mesmo messageId com outro conteúdo vai para DLQ sem movimentação adicional", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    const id = randomUUID();
+    const broker = new RecordingQueue();
+    const consumer = new WagerConsumerWorker(
+      broker,
+      app.get(ProcessTransactionService),
+    );
+    await consumer.handle(delivery(input, id));
+    await consumer.handle(
+      delivery({ ...input, money: { amount: "30.00", currency: "BRL" } }, id),
+    );
+    expect(
+      broker.sent.filter((s) => s.queue.endsWith("dlq.fifo")),
+    ).toHaveLength(1);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("75.00");
+  });
+  test("falha após commit antes do ack é recuperada por inbox sem outro débito", async () => {
+    const wallet = await open();
+    const item = delivery(operation(wallet));
+    const broker = new RecordingQueue();
+    broker.failAck = true;
+    const consumer = new WagerConsumerWorker(
+      broker,
+      app.get(ProcessTransactionService),
+    );
+    await consumer.handle(item);
+    expect(broker.delays).toEqual([5]);
+    broker.failAck = false;
+    await consumer.handle({ ...item, receiveCount: 2 });
+    expect(broker.acknowledgements).toBe(1);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("75.00");
+  });
+  test("rejeição financeira recebe ack e registra inbox; JSON inválido recebe DLQ", async () => {
+    const wallet = await open();
+    const broker = new RecordingQueue();
+    const consumer = new WagerConsumerWorker(
+      broker,
+      app.get(ProcessTransactionService),
+    );
+    await consumer.handle(delivery(operation(wallet, "BET", "500.00")));
+    expect(broker.acknowledgements).toBe(1);
+    expect(broker.sent).toHaveLength(0);
+    await consumer.handle({ ...delivery(operation(wallet)), body: "invalid" });
+    expect(broker.sent).toHaveLength(1);
+    expect(broker.acknowledgements).toBe(2);
+  });
+  test("falha na outbox reverte inbox e finanças; consumidor agenda retry e limita tentativas", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    const item = delivery(input);
+    const broker = new RecordingQueue();
+    const consumer = new WagerConsumerWorker(
+      broker,
+      app.get(ProcessTransactionService),
+    );
+    const connection = orm.em.getConnection();
+    await connection.execute(
+      `create function fail_inbox_outbox() returns trigger language plpgsql as $$ begin raise exception 'Falha simulada'; end; $$;`,
+    );
+    await connection.execute(
+      `create trigger fail_inbox_outbox before insert on outbox_messages for each row execute function fail_inbox_outbox();`,
+    );
+    try {
+      await consumer.handle(item);
+      expect(broker.delays).toEqual([5]);
+      expect(broker.acknowledgements).toBe(0);
+      const envelope = JSON.parse(item.body) as { messageId: string };
+      expect(
+        await orm.em
+          .fork()
+          .count(InboxRecord, { messageId: envelope.messageId }),
+      ).toBe(0);
+      expect(
+        await orm.em.fork().count(WagerTransactionRecord, {
+          externalTransactionId: input.externalTransactionId,
+        }),
+      ).toBe(0);
+      await consumer.handle({ ...item, receiveCount: 5 });
+      expect(broker.sent).toHaveLength(1);
+      expect(broker.acknowledgements).toBe(1);
+    } finally {
+      await connection.execute(
+        `drop trigger fail_inbox_outbox on outbox_messages;`,
+      );
+      await connection.execute(`drop function fail_inbox_outbox();`);
+    }
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("100.00");
+  });
+  const isolateOutbox = async () => {
+    await orm.em
+      .fork()
+      .nativeUpdate(
+        OutboxRecord,
+        { publishedAt: null },
+        { publishedAt: new Date() },
+      );
+  };
+  test("dois publishers dividem eventos com SKIP LOCKED e confirmam publicação", async () => {
+    await isolateOutbox();
+    const wallet = await open();
+    const broker = new RecordingQueue();
+    await Promise.all([
+      new OutboxPublisherWorker(orm, broker).publishOne(),
+      new OutboxPublisherWorker(orm, broker).publishOne(),
+    ]);
+    expect(broker.sent).toHaveLength(2);
+    expect(new Set(broker.sent.map((x) => x.deduplicationId)).size).toBe(2);
+    expect(
+      await orm.em.fork().count(OutboxRecord, {
+        aggregateId: wallet.walletId,
+        publishedAt: null,
+      }),
+    ).toBe(0);
+  });
+  test("outbox guarda retry e outra instância publica depois da recuperação", async () => {
+    await isolateOutbox();
+    const wallet = await open();
+    const broker = new RecordingQueue();
+    broker.failPublish = true;
+    await new OutboxPublisherWorker(orm, broker).runBatch();
+    const rows = await orm.em
+      .fork()
+      .find(OutboxRecord, { aggregateId: wallet.walletId });
+    expect(
+      rows.every(
+        (r) =>
+          r.attempts === 1 &&
+          r.nextAttemptAt !== null &&
+          r.publishedAt === null,
+      ),
+    ).toBe(true);
+    broker.failPublish = false;
+    await new OutboxPublisherWorker(orm, broker).runBatch(
+      new Date(Date.now() + 10000),
+    );
+    expect(broker.sent).toHaveLength(2);
+    expect(
+      await orm.em.fork().count(OutboxRecord, {
+        aggregateId: wallet.walletId,
+        publishedAt: null,
+      }),
+    ).toBe(0);
+  });
+  test("envio confirmado com falha no registro de publicação repete o mesmo eventId", async () => {
+    await isolateOutbox();
+    await open();
+    const broker = new RecordingQueue();
+    const publisher = new OutboxPublisherWorker(orm, broker);
+    const connection = orm.em.getConnection();
+    await connection.execute(
+      `create function fail_publish_mark() returns trigger language plpgsql as $$ begin if new.published_at is not null then raise exception 'Falha simulada'; end if; return new; end; $$;`,
+    );
+    await connection.execute(
+      `create trigger fail_publish_mark before update on outbox_messages for each row execute function fail_publish_mark();`,
+    );
+    try {
+      await expectRejection(publisher.publishOne());
+      expect(broker.sent).toHaveLength(1);
+    } finally {
+      await connection.execute(
+        `drop trigger fail_publish_mark on outbox_messages;`,
+      );
+      await connection.execute(`drop function fail_publish_mark();`);
+    }
+    await publisher.publishOne();
+    expect(broker.sent).toHaveLength(2);
+    expect(broker.sent[0]!.deduplicationId).toBe(
+      broker.sent[1]!.deduplicationId,
+    );
+  });
+  test("inbox serializa entregas concorrentes e também confirma replay de operação HTTP", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    const parsed = JSON.parse(delivery(input).body) as { messageId: string };
+    const context = {
+      messageId: parsed.messageId,
+      consumerName: "parallel-consumer",
+    };
+    const service = app.get(ProcessTransactionService);
+    await Promise.all(
+      Array.from({ length: 10 }, () =>
+        service.execute(
+          { ...input, kind: WagerTransactionKind.Bet },
+          `provider-a:${input.externalTransactionId}`,
+          "correlation",
+          context,
+        ),
+      ),
+    );
+    expect(await orm.em.fork().count(InboxRecord, context)).toBe(1);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("75.00");
+    const other = operation(wallet);
+    await submit(other).expect(200);
+    const result = await service.execute(
+      { ...other, kind: WagerTransactionKind.Bet },
+      `provider-a:${other.externalTransactionId}`,
+      "correlation",
+      { messageId: randomUUID(), consumerName: "http-replay" },
+    );
+    expect(result.idempotentReplay).toBe(true);
+    expect(
+      await orm.em.fork().count(InboxRecord, { consumerName: "http-replay" }),
+    ).toBe(1);
+  });
+  test("falha na confirmação da inbox reverte saldo, ledger, transação e eventos já enviados ao SQL", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    const broker = new RecordingQueue();
+    const item = delivery(input);
+    const connection = orm.em.getConnection();
+    await connection.execute(
+      `create function fail_inbox_confirmation() returns trigger language plpgsql as $$ begin raise exception 'Falha simulada'; end; $$;`,
+    );
+    await connection.execute(
+      `create trigger fail_inbox_confirmation before insert on inbox_messages for each row execute function fail_inbox_confirmation();`,
+    );
+    try {
+      await new WagerConsumerWorker(
+        broker,
+        app.get(ProcessTransactionService),
+      ).handle(item);
+      expect(broker.acknowledgements).toBe(0);
+      expect(broker.delays).toEqual([5]);
+      expect(
+        (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+      ).toBe("100.00");
+      expect(
+        await orm.em.fork().count(WagerTransactionRecord, {
+          externalTransactionId: input.externalTransactionId,
+        }),
+      ).toBe(0);
+      expect(
+        await orm.em
+          .fork()
+          .count(WalletLedgerRecord, { walletId: wallet.walletId }),
+      ).toBe(1);
+      expect(
+        await orm.em
+          .fork()
+          .count(OutboxRecord, { aggregateId: wallet.walletId }),
+      ).toBe(2);
+    } finally {
+      await connection.execute(
+        `drop trigger fail_inbox_confirmation on inbox_messages;`,
+      );
+      await connection.execute(`drop function fail_inbox_confirmation();`);
+    }
+  });
+  test("desligamento aguarda a confirmação em andamento antes de concluir", async () => {
+    const wallet = await open();
+    const item = delivery(operation(wallet));
+    let started!: () => void;
+    let release!: () => void;
+    const ackStarted = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    class SlowAckQueue extends RecordingQueue {
+      private delivered = false;
+      override async receive(): Promise<QueueDelivery[]> {
+        if (this.delivered) return [];
+        this.delivered = true;
+        return [item];
+      }
+      override async acknowledge(): Promise<void> {
+        started();
+        await gate;
+        await super.acknowledge();
+      }
+    }
+    const broker = new SlowAckQueue();
+    const worker = new WagerConsumerWorker(
+      broker,
+      app.get(ProcessTransactionService),
+    );
+    process.env.MESSAGING_ENABLED = "true";
+    try {
+      worker.onApplicationBootstrap();
+      await ackStarted;
+      let closed = false;
+      const stop = worker.beforeApplicationShutdown().then(() => {
+        closed = true;
+      });
+      await Promise.resolve();
+      expect(closed).toBe(false);
+      release();
+      await stop;
+      expect(broker.acknowledgements).toBe(1);
+      expect(
+        (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+      ).toBe("75.00");
+    } finally {
+      release();
+      process.env.MESSAGING_ENABLED = "false";
+    }
   });
 });

@@ -7,6 +7,14 @@
     "incremental": false,
     "noEmitOnError": true
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"],
-  "exclude": ["node_modules", "dist", "dist-test"]
+  "include": [
+    "src/**/*.ts",
+    "test/**/*.ts",
+    "test-sqs/**/*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "dist",
+    "dist-test"
+  ]
 }

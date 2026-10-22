@@ -1,4 +1,5 @@
 import { WageringModule } from "./wagering/wagering.module.js";
+import { MessagingModule } from "./messaging/messaging.module.js";
 import { Module } from "@nestjs/common";
 import { ConfigModule } from "@nestjs/config";
 import { AppController } from "./app.controller.js";
@@ -14,6 +15,7 @@ import { WalletsModule } from "./wallets/wallets.module.js";
     DatabaseModule,
     WalletsModule,
     WageringModule,
+    MessagingModule,
   ],
   controllers: [AppController],
   providers: [AppService],

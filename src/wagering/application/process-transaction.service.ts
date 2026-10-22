@@ -8,7 +8,9 @@ import { referenceIsCompatible, movementDirection, } from "../domain/transaction
 import { WagerTransactionPendingReference } from "../domain/wager-transaction-pending-reference.event.js";
 import { REFERENCE_TTL_MS, nextReferenceAttempt, } from "./reference-retry-policy.js";
 import { MikroORM } from "@mikro-orm/postgresql";
-import { randomUUID } from "node:crypto";
+import { InboxRecord } from "../../database/entities/inbox.record.js";
+import { InboxMessage } from "../../messaging/domain/inbox-message.js";
+import { createHash, randomUUID } from "node:crypto";
 import { WalletRecord } from "../../database/entities/wallet.record.js";
 import { WagerTransactionRecord } from "../../database/entities/wager-transaction.record.js";
 import { OutboxRecord } from "../../database/entities/outbox.record.js";
@@ -22,11 +24,28 @@ import { WagerTransactionProcessed } from "../domain/wager-transaction-processed
 import { WagerTransactionRejected } from "../domain/wager-transaction-rejected.event.js";
 import { payloadHash, type TransactionPayload } from "./transaction-payload.js";
 
+export interface InboxContext {
+  messageId: string;
+  consumerName: string;
+}
+export interface TransactionResponse {
+  transactionId: string;
+  status: Status;
+  balance?: { amount: string; currency: string };
+  failureCode?: FailureCode;
+  idempotentReplay: boolean;
+}
+
 @Injectable()
 export class ProcessTransactionService {
   constructor(private readonly orm: MikroORM) {}
 
-  async execute(input: TransactionPayload, key: string, correlationId: string) {
+  async execute(
+    input: TransactionPayload,
+    key: string,
+    correlationId: string,
+    inbox?: InboxContext,
+  ): Promise<TransactionResponse> {
     if (typeof key !== "string" || !key.trim() || key.length > 255)
       throw new BadRequestException({ code: "INVALID_IDEMPOTENCY_KEY" });
     if (
@@ -56,6 +75,9 @@ export class ProcessTransactionService {
     if (input.kind !== Kind.Loss && money.isZero())
       throw new BadRequestException({ code: "ZERO_MOVEMENT" });
     const hash = payloadHash(input);
+    const inboxHash = createHash("sha256")
+      .update(JSON.stringify([hash, key]))
+      .digest("hex");
     const identity = {
       $or: [
         { idempotencyKey: key },
@@ -74,8 +96,21 @@ export class ProcessTransactionService {
           { lockMode: LockMode.PESSIMISTIC_WRITE },
         );
         if (!record) throw new NotFoundException({ code: "WALLET_NOT_FOUND" });
+        if (inbox) {
+          const receipt = await em.findOne(InboxRecord, {
+            messageId: inbox.messageId,
+            consumerName: inbox.consumerName,
+          });
+          if (receipt) return this.inboxReplay(receipt, inboxHash);
+        }
         const existing = await em.find(WagerTransactionRecord, identity);
-        if (existing.length) return this.replay(existing, key, hash);
+        if (existing.length)
+          return this.completeInbox(
+            em,
+            inbox,
+            inboxHash,
+            this.replay(existing, key, hash),
+          );
         if (record.playerId !== input.playerId)
           throw new BadRequestException({ code: "WALLET_PLAYER_MISMATCH" });
         const wallet = walletFromRecord(record);
@@ -88,16 +123,39 @@ export class ProcessTransactionService {
           payloadHash: hash,
           createdAt: at,
         });
-        return this.apply(em, record, wallet, transaction, correlationId, at);
+        const result = await this.apply(
+          em,
+          record,
+          wallet,
+          transaction,
+          correlationId,
+          at,
+        );
+        return this.completeInbox(em, inbox, inboxHash, result);
       });
     } catch (error) {
       // Uma colisão entre carteiras diferentes aborta a transação perdedora.
       // Só consultamos a vencedora usando outro EntityManager após o rollback.
       if (error instanceof UniqueConstraintViolationException) {
+        if (inbox) {
+          const receipt = await this.orm.em
+            .fork()
+            .findOne(InboxRecord, {
+              messageId: inbox.messageId,
+              consumerName: inbox.consumerName,
+            });
+          if (receipt) return this.inboxReplay(receipt, inboxHash);
+        }
         const existing = await this.orm.em
           .fork()
           .find(WagerTransactionRecord, identity);
-        if (existing.length) return this.replay(existing, key, hash);
+        if (existing.length) {
+          const result = this.replay(existing, key, hash);
+          // Reentra após o rollback para confirmar inbox e replay juntos.
+          return inbox
+            ? this.execute(input, key, correlationId, inbox)
+            : result;
+        }
       }
       if (
         error instanceof ConnectionException ||
@@ -120,6 +178,41 @@ export class ProcessTransactionService {
         throw new BadRequestException({ code: "MONETARY_LIMIT_EXCEEDED" });
       throw error;
     }
+  }
+
+  private async completeInbox(
+    em: EntityManager,
+    inbox: InboxContext | undefined,
+    hash: string,
+    result: TransactionResponse,
+  ): Promise<TransactionResponse> {
+    if (!inbox) return result;
+    const message = InboxMessage.receive({
+      ...inbox,
+      payloadHash: hash,
+      receivedAt: new Date(),
+    });
+    message.markProcessed(new Date());
+    em.persist(
+      Object.assign(new InboxRecord(), {
+        messageId: message.messageId,
+        consumerName: message.consumerName,
+        payloadHash: message.payloadHash,
+        receivedAt: message.receivedAt,
+        processedAt: message.processedAt,
+        result,
+      }),
+    );
+    await em.flush();
+    return result;
+  }
+
+  private inboxReplay(receipt: InboxRecord, hash: string): TransactionResponse {
+    if (receipt.payloadHash !== hash)
+      throw new ConflictException({ code: "INBOX_PAYLOAD_CONFLICT" });
+    if (!receipt.processedAt || !receipt.result)
+      throw new ServiceUnavailableException({ code: "INBOX_IN_PROGRESS" });
+    return { ...receipt.result, idempotentReplay: true };
   }
 
   // Utilizado pelo worker; a ordem dos locks continua carteira -> agendamento.
@@ -373,7 +466,10 @@ export class ProcessTransactionService {
     return this.response(records[0]!, true);
   }
 
-  private response(record: WagerTransactionRecord, replay: boolean) {
+  private response(
+    record: WagerTransactionRecord,
+    replay: boolean,
+  ): TransactionResponse {
     return {
       transactionId: record.id,
       status: record.status,
