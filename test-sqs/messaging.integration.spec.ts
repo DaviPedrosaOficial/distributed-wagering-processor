@@ -1,4 +1,6 @@
 import "reflect-metadata";
+import request from "supertest";
+import { OperationsModule } from "../src/operations/operations.module.js";
 import { LedgerDirection } from "../src/wallets/domain/wallet-ledger-entry.js";
 import { FailureCode } from "../src/wagering/domain/wager-transaction.js";
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
@@ -29,6 +31,7 @@ const prefix = `wager-test-${Date.now()}`;
 process.env.SQS_REQUEST_QUEUE = `${prefix}.fifo`;
 process.env.SQS_DLQ = `${prefix}-dlq.fifo`;
 process.env.SQS_EVENT_QUEUE = `${prefix}-events.fifo`;
+
 const endpoint = new URL(process.env.SQS_ENDPOINT ?? "http://127.0.0.1:4566");
 if (
   ![
@@ -52,6 +55,7 @@ describe("PostgreSQL e LocalStack reais", () => {
         MikroOrmModule.forRoot(integrationConfig()),
         WalletsModule,
         WageringModule,
+        OperationsModule,
       ],
     }).compile();
     app = module.createNestApplication();
@@ -145,12 +149,10 @@ describe("PostgreSQL e LocalStack reais", () => {
       }),
     ).toBe(1);
     expect(
-      await orm.em
-        .fork()
-        .count(WalletLedgerRecord, {
-          walletId: wallet.id,
-          direction: LedgerDirection.Debit,
-        }),
+      await orm.em.fork().count(WalletLedgerRecord, {
+        walletId: wallet.id,
+        direction: LedgerDirection.Debit,
+      }),
     ).toBe(1);
   }, 30000);
   test("commit sem ack é retomado por nova instância do consumidor", async () => {
@@ -295,4 +297,10 @@ describe("PostgreSQL e LocalStack reais", () => {
         .count(OutboxRecord, { aggregateId: wallet.id, publishedAt: null }),
     ).toBe(0);
   }, 30000);
+  test("readiness verifica PostgreSQL e filas reais", async () => {
+    const result = await request(app.getHttpServer())
+      .get("/health/ready")
+      .expect(200);
+    expect(result.body.dependencies).toEqual({ postgres: true, sqs: true });
+  });
 });

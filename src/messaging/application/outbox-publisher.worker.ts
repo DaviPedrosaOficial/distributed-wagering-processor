@@ -1,3 +1,4 @@
+import { telemetry } from "../../operations/telemetry.js";
 import { Injectable, type OnApplicationBootstrap, type BeforeApplicationShutdown, } from "@nestjs/common";
 import { LockMode } from "@mikro-orm/core";
 import { MikroORM } from "@mikro-orm/postgresql";
@@ -6,16 +7,16 @@ import { OutboxMessage } from "../domain/outbox-message.js";
 import { QueuePort, queueNames, messagingLog } from "./queue.port.js";
 
 @Injectable()
-export class OutboxPublisherWorker
-  implements OnApplicationBootstrap, BeforeApplicationShutdown
-{
+export class OutboxPublisherWorker implements OnApplicationBootstrap, BeforeApplicationShutdown {
+  
   private timer?: ReturnType<typeof setInterval>;
   private active?: Promise<void>;
   private stopping = false;
-  constructor(
-    private readonly orm: MikroORM,
+  
+  constructor( private readonly orm: MikroORM,
     private readonly broker: QueuePort,
   ) {}
+  
   onApplicationBootstrap(): void {
     if (process.env.MESSAGING_ENABLED !== "true") return;
     this.timer = setInterval(() => {
@@ -59,6 +60,7 @@ export class OutboxPublisherWorker
         message.markPublished(new Date());
       } catch {
         message.scheduleRetry(new Date());
+        telemetry.inc("wager_retries_total", { source: "outbox" });
         messagingLog("outbox_retry_scheduled", {
           eventId: record.id,
           walletId: record.aggregateId,

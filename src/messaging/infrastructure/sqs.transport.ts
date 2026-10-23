@@ -16,15 +16,30 @@ export class SqsTransport extends QueuePort implements OnApplicationShutdown {
     requestHandler: { connectionTimeout: 2000, requestTimeout: 15000 },
   });
   private readonly urls = new Map<string, string>();
-  async queueUrl(name: string): Promise<string> {
+  async queueUrl(name: string, signal?: AbortSignal): Promise<string> {
     const cached = this.urls.get(name);
     if (cached) return cached;
     const result = await this.client.send(
       new GetQueueUrlCommand({ QueueName: name }),
+      { abortSignal: signal },
     );
     if (!result.QueueUrl) throw new Error("SQS não retornou QueueUrl.");
     this.urls.set(name, result.QueueUrl);
     return result.QueueUrl;
+  }
+  async ready(): Promise<void> {
+    const signal = AbortSignal.timeout(3000);
+    await Promise.all(
+      Object.values(queueNames()).map(async (name) => {
+        await this.client.send(
+          new GetQueueAttributesCommand({
+            QueueUrl: await this.queueUrl(name, signal),
+            AttributeNames: ["QueueArn"],
+          }),
+          { abortSignal: signal },
+        );
+      }),
+    );
   }
   async setup(): Promise<void> {
     const names = queueNames();

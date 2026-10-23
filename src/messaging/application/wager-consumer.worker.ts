@@ -1,3 +1,4 @@
+import { telemetry } from "../../operations/telemetry.js";
 import { HttpException, Injectable, type OnApplicationBootstrap, type BeforeApplicationShutdown, } from "@nestjs/common";
 import { createHash } from "node:crypto";
 import { ProcessTransactionService } from "../../wagering/application/process-transaction.service.js";
@@ -5,7 +6,6 @@ import { QueuePort, queueNames, messagingLog, type QueueDelivery, } from "./queu
 import { InvalidQueueMessageError, parseWagerMessage, } from "./parse-wager-message.js";
 
 export const WAGER_CONSUMER_NAME = "wager-transactions-v1";
-
 export const retryDelaySeconds = (receiveCount: number) =>
   Math.min(5 * 2 ** Math.min(Math.max(receiveCount - 1, 0), 6), 300);
 
@@ -116,6 +116,7 @@ export class WagerConsumerWorker
             sourceMessageId: delivery.brokerMessageId,
           },
         );
+        telemetry.inc("wager_dlq_total");
         await this.broker.acknowledge(names.requests, delivery.receiptHandle);
         messagingLog("sqs_dead_lettered", {
           ...context,
@@ -127,6 +128,7 @@ export class WagerConsumerWorker
           delivery.receiptHandle,
           retryDelaySeconds(delivery.receiveCount),
         );
+        telemetry.inc("wager_retries_total", { source: "sqs" });
         messagingLog("sqs_retry_scheduled", {
           ...context,
           attempt: delivery.receiveCount,

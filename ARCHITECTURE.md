@@ -1,6 +1,6 @@
 # Decisões de arquitetura
 
-Revisado em 23/10/2026, com as decisões de mensageria adotadas em 22/10/2026.
+Revisado em 23/10/2026, incluindo consultas, reconciliação e diagnóstico.
 
 Este documento registra as decisões já adotadas no Distributed Wagering Processor,
 suas justificativas, trade-offs e limitações. A referência é o
@@ -290,7 +290,8 @@ mas o banco continua responsável por idempotência e correção financeira.
 
 Consumidor e publicador só iniciam com MESSAGING_ENABLED=true. Sem isso, a API pode
 processar e acumular outbox. Separar essa configuração facilita testes e execução
-local; não significa readiness, que ainda não foi implementada.
+local; readiness verifica separadamente o acesso ao PostgreSQL e às três filas,
+mesmo com os workers desativados.
 
 ### Inbox e confirmação após o commit
 
@@ -389,8 +390,8 @@ impede interrupção forçada; nesse caso a recuperação depende de banco e bro
 Os logs dos workers são JSON com IDs disponíveis de correlação, mensagem,
 transação, carteira e provedor, sem corpos financeiros completos. Quando não há
 correlação válida no envelope, ela é derivada de forma estável do messageId.
-Esses logs não constituem observabilidade completa: logs globais da API, métricas
-e health checks permanecem pendentes.
+O bloco de diagnóstico acrescenta logs HTTP, métricas e health checks, descritos
+na seção 9. Os logs padrão de inicialização do Nest mantêm o formato do framework.
 
 ## 8. Contratos HTTP e classificação dos resultados
 
@@ -431,16 +432,84 @@ null; o serviço exige referência para as reversões.
 
 O serviço traduz exceções de conexão e os SQLSTATE 40001, 40P01, 55P03, 57014,
 57P01, 57P02 e 57P03 em TRANSIENT_DATABASE_FAILURE. Erros inesperados são
-propagados e provocam rollback. Esse tratamento ainda é local ao processamento,
-não uma política global aplicada a todos os endpoints. Autenticação e seu ponto de
-extensão continuam
+propagados e provocam rollback. O filtro global também traduz exceções do driver SQL em 503 quando transitórias
+ou 500 nos demais casos, sem expor SQL. Autenticação e seu ponto de extensão continuam
 pendentes; verificar o playerId não comprova a identidade de quem chama a API.
 
-## 9. Validação e limites conhecidos
+## 9. Consultas, reconciliação e observabilidade — 23/10/2026
 
-Build e lint passaram. A suíte possui 115 testes unitários aprovados. No ambiente
-local com containers, passaram 55 testes HTTP/SQL com PostgreSQL 17 e seis testes
-de mensageria com PostgreSQL e LocalStack reais.
+### Consultas e paginação do ledger
+
+Separei as leituras em WalletQueriesService e TransactionQueriesService. Consultar
+não executa novamente operações de domínio. A transação é localizada pelo UUID ou
+por (providerId, externalTransactionId), utilizando a unicidade existente. A resposta
+preserva result_balance e não expõe payloadHash nem chave de idempotência.
+
+O ledger usa paginação por chave, com ordem crescente (created_at, id), limite
+padrão 50 e máximo 100. O ID desempata datas iguais. Escolhi esse formato para
+continuar a leitura sem percorrer um offset crescente. O cursor contém versão,
+carteira e ID da última entrada em base64url; formato, carteira e existência do
+registro são validados. Ele não é criptografado, assinado ou uma autorização.
+
+O SQL recupera a data diretamente da entrada usada como âncora, preservando a
+precisão do PostgreSQL em vez de reconstruí-la com Date. A imutabilidade do ledger
+mantém essa âncora estável. O custo é uma consulta vinculada ao registro anterior.
+Não há snapshot congelado entre páginas: inserções retroativas anteriores à âncora
+não serão revisitadas, e novas entradas posteriores podem aparecer.
+
+### Reconciliação sem reparo automático
+
+Adotei uma única instrução SELECT para comparar o saldo materializado com a soma
+dos créditos menos os débitos, incluindo o crédito de abertura. O snapshot da
+instrução evita comparar metades de uma movimentação concorrente, cujas gravações
+são atômicas. A soma ocorre em NUMERIC; decimal.js formata strings com duas casas,
+sem converter dinheiro para number.
+
+O resultado apresenta saldo armazenado, calculado, diferença, quantidade de
+lançamentos e conflitos de moeda. consistent exige diferença zero e nenhum
+conflito de moeda. Uma carteira aberta com zero e sem lançamentos reconcilia em zero.
+Escolhi somente detectar: divergências geram resposta, log e métrica, sem corrigir
+saldo ou modificar ledger. Uma correção automática exigiria uma decisão financeira
+que este endpoint não possui autorização para tomar.
+
+### Saúde, métricas e correlação
+
+GET /health/live responde sem acessar dependências, distinguindo processo vivo de
+infraestrutura disponível após a inicialização. GET /health/ready verifica SELECT 1
+e acesso às três filas; retorna 503 se alguma verificação falhar. O adaptador SQS
+limita sua verificação a três segundos e não consome mensagens. Mesmo com workers
+desativados, readiness verifica o broker configurado.
+
+GET /metrics expõe texto Prometheus. Contadores e histograma são locais ao processo
+e reiniciam com ele: resultados, replays, retries por origem, DLQ, falhas de lock,
+reconciliação, respostas HTTP e duração. São diagnóstico, nunca idempotência ou
+auditoria durável. A contagem de conflitos inclui exceções reconhecidas de lock,
+deadlock e serialização; não mede espera normal por lock.
+
+Gauges consultam estados persistidos, quantidade de eventos pendentes e idade do
+mais antigo. Como representam dados compartilhados, não devem ser somados
+cegamente entre réplicas. /metrics depende do banco para obtê-los. Não acrescentei
+dashboard ou OpenTelemetry; o formato permite coleta externa sem nova dependência.
+
+Um interceptor global aceita ou gera X-Correlation-Id, devolve o header e registra
+JSON com método, caminho, status, duração e IDs disponíveis. O serviço financeiro
+registra seu resultado após o commit. Não registro corpo financeiro completo,
+valores monetários nem headers de autenticação. Correlação é diagnóstico, não
+identidade autenticada nem chave de idempotência.
+
+Essas decisões não exigiram migration, alteração de schema ou dependência nova.
+
+## 10. Validação e limites conhecidos
+
+Neste bloco, build e lint passaram, assim como 117 testes unitários e 62 HTTP/SQL
+com PGlite e transporte controlado no ambiente de desenvolvimento. A suíte SQS
+agora possui sete cenários, incluindo readiness real. A confirmação deste incremento
+com PostgreSQL 17 e LocalStack no Docker do autor permanece pendente; o bloco
+anterior passou 55 HTTP/SQL e seis cenários com essas dependências reais.
+
+Os novos testes cobrem datas iguais na paginação, cursor inválido ou de outra
+carteira, saldo histórico nas consultas, reconciliação durante movimentações,
+divergência detectada sem reparo, correlação, métricas e readiness indisponível.
 
 Os testes cobrem migrations reversíveis, constraints, abertura e versão inicial,
 precisão monetária, operações, referências, replay e rollback. No reprocessamento,
@@ -469,6 +538,6 @@ HTTP/SQL reverte e reaplica migrations nele. A suíte SQS cria filas com nomes
 únicos e as remove ao finalizar. As suítes que compartilham esse banco devem
 rodar em sequência, sem workers externos usando o banco de testes.
 
-Consultas de ledger/transações, reconciliação, health checks, métricas, logs globais,
-autenticação/ponto de extensão e classificação operacional completa de FAILED
-continuam pendentes. Não há alegação de atendimento integral do desafio.
+Autenticação/ponto de extensão e classificação operacional completa de FAILED
+continuam pendentes, além das provas com processos e interrupções reais descritas
+acima. Não há alegação de atendimento integral do desafio.

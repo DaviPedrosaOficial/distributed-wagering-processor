@@ -1,11 +1,37 @@
 import "reflect-metadata";
+import { OperationsModule } from "../src/operations/operations.module.js";
 import { MessagingModule } from "../src/messaging/messaging.module.js";
 import { InboxRecord } from "../src/database/entities/inbox.record.js";
 import { QueuePort, type QueueDelivery, } from "../src/messaging/application/queue.port.js";
 import { WagerConsumerWorker } from "../src/messaging/application/wager-consumer.worker.js";
 import { OutboxPublisherWorker } from "../src/messaging/application/outbox-publisher.worker.js";
+import { ProcessTransactionService } from "../src/wagering/application/process-transaction.service.js";
+import { ReferenceRetryWorker } from "../src/wagering/application/reference-retry.worker.js";
+import { ReferenceScheduleRecord } from "../src/database/entities/reference-schedule.record.js";
+import { WageringModule } from "../src/wagering/wagering.module.js";
+import { afterAll, beforeAll, describe, expect, test, setSystemTime, } from "bun:test";
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { MikroOrmModule } from "@mikro-orm/nestjs";
+import { MikroORM } from "@mikro-orm/postgresql";
+import { integrationConfig } from "./integration-config.js";
+import { WalletsModule } from "../src/wallets/wallets.module.js";
+import { WalletRecord } from "../src/database/entities/wallet.record.js";
+import { WalletLedgerRecord } from "../src/database/entities/wallet-ledger.record.js";
+import { WagerTransactionRecord } from "../src/database/entities/wager-transaction.record.js";
+import { OutboxRecord } from "../src/database/entities/outbox.record.js";
+import { transactionFromRecord } from "../src/database/mappers/financial-records.mapper.js";
+import { WagerTransactionKind, WagerTransactionStatus, } from "../src/wagering/domain/wager-transaction.js";
+import { LedgerDirection } from "../src/wallets/domain/wallet-ledger-entry.js";
+import { OpenWalletService } from "../src/wallets/application/open-wallet.service.js";
+import { randomUUID } from "node:crypto";
+import request from "supertest";
 
 class RecordingQueue extends QueuePort {
+  failReady = false;
+  async ready(): Promise<void> {
+    if (this.failReady) throw new Error("Broker indisponível");
+  }
   sent: Array<{ queue: string; body: string; deduplicationId: string }> = [];
   acknowledgements = 0;
   delays: number[] = [];
@@ -40,37 +66,13 @@ class RecordingQueue extends QueuePort {
   }
 }
 
-import { ProcessTransactionService } from "../src/wagering/application/process-transaction.service.js";
-import { ReferenceRetryWorker } from "../src/wagering/application/reference-retry.worker.js";
-import { ReferenceScheduleRecord } from "../src/database/entities/reference-schedule.record.js";
-import { WageringModule } from "../src/wagering/wagering.module.js";
-import { afterAll, beforeAll, describe, expect, test } from "bun:test";
-import { Test } from "@nestjs/testing";
-import type { INestApplication } from "@nestjs/common";
-import { MikroOrmModule } from "@mikro-orm/nestjs";
-import { MikroORM } from "@mikro-orm/postgresql";
-import { randomUUID } from "node:crypto";
-import request from "supertest";
-import { integrationConfig } from "./integration-config.js";
-import { WalletsModule } from "../src/wallets/wallets.module.js";
-import { WalletRecord } from "../src/database/entities/wallet.record.js";
-import { WalletLedgerRecord } from "../src/database/entities/wallet-ledger.record.js";
-import { WagerTransactionRecord } from "../src/database/entities/wager-transaction.record.js";
-import { OutboxRecord } from "../src/database/entities/outbox.record.js";
-import { transactionFromRecord } from "../src/database/mappers/financial-records.mapper.js";
-import {
-  WagerTransactionKind,
-  WagerTransactionStatus,
-} from "../src/wagering/domain/wager-transaction.js";
-import { LedgerDirection } from "../src/wallets/domain/wallet-ledger-entry.js";
-import { OpenWalletService } from "../src/wallets/application/open-wallet.service.js";
-
 process.env.REFERENCE_WORKER_ENABLED = "false";
 process.env.MESSAGING_ENABLED = "false";
 
 describe("Carteiras e operações (integração PostgreSQL)", () => {
   let app: INestApplication;
   let orm: MikroORM;
+  const healthBroker = new RecordingQueue();
   const body = (
     playerId: string = randomUUID(),
     amount = "100.00",
@@ -94,8 +96,12 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
         WalletsModule,
         WageringModule,
         MessagingModule,
+        OperationsModule,
       ],
-    }).compile();
+    })
+      .overrideProvider(QueuePort)
+      .useValue(healthBroker)
+      .compile();
     app = module.createNestApplication();
     app.useLogger(false);
     orm = app.get(MikroORM);
@@ -1283,5 +1289,202 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
       release();
       process.env.MESSAGING_ENABLED = "false";
     }
+  });
+  test("consulta transação por ID interno e identidade externa com resultado histórico", async () => {
+    const wallet = await open();
+    const input = operation(wallet);
+    const result = await submit(input).expect(200);
+    await submit(operation(wallet, "WIN", "40.00")).expect(200);
+    const internal = await api()
+      .get(`/wagering/transactions/${result.body.transactionId}`)
+      .expect(200);
+    const external = await api()
+      .get(
+        `/providers/${input.providerId}/wagering/transactions/${input.externalTransactionId}`,
+      )
+      .expect(200);
+    expect(internal.body).toEqual(external.body);
+    expect(internal.body.balance.amount).toBe("75.00");
+    expect(internal.body.money.amount).toBe("25.00");
+    await api().get(`/wagering/transactions/${randomUUID()}`).expect(404);
+    await api().get("/wagering/transactions/invalid").expect(400);
+    await api()
+      .get(
+        `/providers/provider-other/wagering/transactions/${input.externalTransactionId}`,
+      )
+      .expect(404);
+  });
+  test("ledger pagina por cursor e desempata entradas da mesma data sem repetir", async () => {
+    setSystemTime(new Date());
+    let wallet!: { playerId: string; walletId: string };
+    try {
+      wallet = await open();
+      await submit(operation(wallet)).expect(200);
+      await submit(operation(wallet, "WIN", "40.00")).expect(200);
+    } finally {
+      setSystemTime();
+    }
+    // Domínio gera milissegundos; o cursor resolve a data no SQL e preserva microssegundos.
+    const first = await api()
+      .get(`/wallets/${wallet.walletId}/ledger?limit=1`)
+      .expect(200);
+    expect(first.body.items).toHaveLength(1);
+    expect(typeof first.body.nextCursor).toBe("string");
+    const second = await api()
+      .get(`/wallets/${wallet.walletId}/ledger`)
+      .query({ limit: 1, cursor: first.body.nextCursor })
+      .expect(200);
+    const third = await api()
+      .get(`/wallets/${wallet.walletId}/ledger`)
+      .query({ limit: 1, cursor: second.body.nextCursor })
+      .expect(200);
+    expect(third.body.nextCursor).toBeNull();
+    expect(first.body.items[0].createdAt).toBe(second.body.items[0].createdAt);
+    expect(second.body.items[0].createdAt).toBe(third.body.items[0].createdAt);
+    expect(
+      new Set([
+        first.body.items[0].id,
+        second.body.items[0].id,
+        third.body.items[0].id,
+      ]).size,
+    ).toBe(3);
+    const other = await open();
+    await api()
+      .get(`/wallets/${other.walletId}/ledger`)
+      .query({ cursor: first.body.nextCursor })
+      .expect(400);
+    for (const limit of [0, 101, "abc", "1.5"])
+      await api()
+        .get(`/wallets/${wallet.walletId}/ledger`)
+        .query({ limit })
+        .expect(400);
+    await api()
+      .get(`/wallets/${wallet.walletId}/ledger`)
+      .query({ cursor: "invalid" })
+      .expect(400);
+  });
+  test("reconciliação inclui abertura e operações sem alterar saldo", async () => {
+    const wallet = await open();
+    await submit(operation(wallet)).expect(200);
+    await submit(operation(wallet, "WIN", "40.00")).expect(200);
+    const result = await api()
+      .post(`/wallets/${wallet.walletId}/reconciliation`)
+      .expect(200);
+    expect(result.body.storedBalance).toEqual({
+      amount: "115.00",
+      currency: "BRL",
+    });
+    expect(result.body.calculatedBalance).toEqual(result.body.storedBalance);
+    expect(result.body.difference.amount).toBe("0.00");
+    expect(result.body.consistent).toBe(true);
+    expect(result.body.checkedEntries).toBe(3);
+    const empty = await api()
+      .post("/wallets")
+      .send(body(randomUUID(), "0.00"))
+      .expect(201);
+    const zero = await api()
+      .post(`/wallets/${empty.body.id}/reconciliation`)
+      .expect(200);
+    expect(zero.body.checkedEntries).toBe(0);
+    expect(zero.body.consistent).toBe(true);
+    expect(zero.body.calculatedBalance.amount).toBe("0.00");
+    await api().post(`/wallets/${randomUUID()}/reconciliation`).expect(404);
+  });
+  test("divergência de reconciliação gera sinalização e métrica sem reparo silencioso", async () => {
+    const wallet = await open();
+    await orm.em
+      .fork()
+      .nativeUpdate(
+        WalletRecord,
+        { id: wallet.walletId },
+        { balance: "90.00" },
+      );
+    try {
+      const result = await api()
+        .post(`/wallets/${wallet.walletId}/reconciliation`)
+        .expect(200);
+      expect(result.body.consistent).toBe(false);
+      expect(result.body.difference.amount).toBe("-10.00");
+      expect(
+        (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+      ).toBe("90.00");
+      const metrics = await api().get("/metrics").expect(200);
+      expect(metrics.text).toContain(
+        'wager_reconciliation_total{consistent="false"}',
+      );
+    } finally {
+      await orm.em
+        .fork()
+        .nativeUpdate(
+          WalletRecord,
+          { id: wallet.walletId },
+          { balance: "100.00" },
+        );
+    }
+  });
+  test("health separa liveness de readiness e métricas expõem fila de outbox", async () => {
+    await api().get("/health/live").expect(200);
+    const ready = await api().get("/health/ready").expect(200);
+    expect(ready.body.dependencies).toEqual({ postgres: true, sqs: true });
+    healthBroker.failReady = true;
+    try {
+      const failed = await api().get("/health/ready").expect(503);
+      expect(failed.body.dependencies.sqs).toBe(false);
+      await api().get("/health/live").expect(200);
+    } finally {
+      healthBroker.failReady = false;
+    }
+    const metrics = await api().get("/metrics").expect(200);
+    expect(metrics.text).toContain("wager_outbox_lag_seconds ");
+    expect(metrics.text).toContain("wager_transactions_current");
+    expect(metrics.text).toContain("wager_processing_duration_seconds_count");
+    expect(metrics.headers["content-type"]).toContain("text/plain");
+  });
+  test("reconciliação permanece consistente enquanto apostas concorrentes são confirmadas", async () => {
+    const wallet = await open();
+    const results = await Promise.all([
+      ...Array.from({ length: 5 }, () =>
+        submit(operation(wallet, "BET", "1.00")),
+      ),
+      ...Array.from({ length: 10 }, () =>
+        api().post(`/wallets/${wallet.walletId}/reconciliation`),
+      ),
+    ]);
+    expect(results.every((result) => result.status === 200)).toBe(true);
+    expect(
+      results
+        .filter((result) => typeof result.body.consistent === "boolean")
+        .every((result) => result.body.consistent === true),
+    ).toBe(true);
+    const final = await api()
+      .post(`/wallets/${wallet.walletId}/reconciliation`)
+      .expect(200);
+    expect(final.body.calculatedBalance.amount).toBe("95.00");
+    expect(final.body.checkedEntries).toBe(6);
+  });
+  test("consultas mantêm correlação e validam carteira ausente e cursor inexistente", async () => {
+    const wallet = await open();
+    const response = await api()
+      .get(`/wallets/${wallet.walletId}`)
+      .set("X-Correlation-Id", "test-correlation")
+      .expect(200);
+    expect(response.headers["x-correlation-id"]).toBe("test-correlation");
+    await api().get(`/wallets/${randomUUID()}/ledger`).expect(404);
+    const cursor = Buffer.from(
+      JSON.stringify({ v: 1, walletId: wallet.walletId, id: randomUUID() }),
+    ).toString("base64url");
+    await api()
+      .get(`/wallets/${wallet.walletId}/ledger`)
+      .query({ cursor })
+      .expect(400);
+    const empty = await api()
+      .post("/wallets")
+      .send(body(randomUUID(), "0.00"))
+      .expect(201);
+    const ledger = await api()
+      .get(`/wallets/${empty.body.id}/ledger`)
+      .expect(200);
+    expect(ledger.body.items).toEqual([]);
+    expect(ledger.body.nextCursor).toBeNull();
   });
 });

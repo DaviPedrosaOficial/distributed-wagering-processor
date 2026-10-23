@@ -1,3 +1,4 @@
+import { telemetry, operationalLog } from "../../operations/telemetry.js";
 import { BadRequestException, ConflictException, Injectable, NotFoundException, ServiceUnavailableException, } from "@nestjs/common";
 import { ConnectionException, DriverException, LockMode, UniqueConstraintViolationException, } from "@mikro-orm/core";
 import type { EntityManager } from "@mikro-orm/postgresql";
@@ -41,6 +42,37 @@ export class ProcessTransactionService {
   constructor(private readonly orm: MikroORM) {}
 
   async execute(
+    input: TransactionPayload,
+    key: string,
+    correlationId: string,
+    inbox?: InboxContext,
+  ): Promise<TransactionResponse> {
+    const started = performance.now();
+    const channel = inbox ? "sqs" : "http";
+    try {
+      const result = await this.executeCore(input, key, correlationId, inbox);
+      telemetry.inc("wager_transaction_results_total", {
+        status: result.status,
+        channel,
+      });
+      if (result.idempotentReplay)
+        telemetry.inc("wager_duplicates_total", { channel });
+      operationalLog("transaction_completed", {
+        correlationId,
+        messageId: inbox?.messageId,
+        transactionId: result.transactionId,
+        walletId: input.walletId,
+        providerId: input.providerId,
+        status: result.status,
+        idempotentReplay: result.idempotentReplay,
+      });
+      return result;
+    } finally {
+      telemetry.observe((performance.now() - started) / 1000, channel);
+    }
+  }
+
+  private async executeCore(
     input: TransactionPayload,
     key: string,
     correlationId: string,
@@ -138,12 +170,10 @@ export class ProcessTransactionService {
       // Só consultamos a vencedora usando outro EntityManager após o rollback.
       if (error instanceof UniqueConstraintViolationException) {
         if (inbox) {
-          const receipt = await this.orm.em
-            .fork()
-            .findOne(InboxRecord, {
-              messageId: inbox.messageId,
-              consumerName: inbox.consumerName,
-            });
+          const receipt = await this.orm.em.fork().findOne(InboxRecord, {
+            messageId: inbox.messageId,
+            consumerName: inbox.consumerName,
+          });
           if (receipt) return this.inboxReplay(receipt, inboxHash);
         }
         const existing = await this.orm.em
@@ -153,10 +183,15 @@ export class ProcessTransactionService {
           const result = this.replay(existing, key, hash);
           // Reentra após o rollback para confirmar inbox e replay juntos.
           return inbox
-            ? this.execute(input, key, correlationId, inbox)
+            ? this.executeCore(input, key, correlationId, inbox)
             : result;
         }
       }
+      if (
+        error instanceof DriverException &&
+        ["40001", "40P01", "55P03"].includes(error.code ?? "")
+      )
+        telemetry.inc("wager_lock_conflicts_total");
       if (
         error instanceof ConnectionException ||
         (error instanceof DriverException &&

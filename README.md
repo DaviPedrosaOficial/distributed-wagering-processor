@@ -17,11 +17,13 @@ AWS SDK/LocalStack, com infraestrutura local em Docker Compose.
 - Replay histórico, referências validadas e espera com backoff e TTL de 15 minutos.
 - Inbox, finanças e outbox atômicas; ack após commit, retry e DLQ.
 - Publicador da outbox com seleção concorrente e eventos versionados.
+- Ledger paginado, consulta de transações e reconciliação sem alteração de saldo.
+- Liveness, readiness de PostgreSQL/SQS, métricas e logs com correlação.
 
-Ainda faltam consultas de ledger/transações, reconciliação, health checks,
-observabilidade completa e validação com processos independentes e interrupções
-reais. A API não possui autenticação nem seu ponto de extensão. A entrega de
-eventos pode se repetir; consumidores devem deduplicar pelo eventId.
+Ainda faltam validações com processos independentes e interrupções reais, a
+classificação operacional completa de falhas definitivas e o ponto de extensão de
+autenticação. A API ainda não possui autenticação. A entrega de eventos pode se
+repetir; consumidores devem deduplicar pelo eventId.
 
 ## Executar localmente
 
@@ -46,11 +48,18 @@ O worker de referências inicia por padrão; `REFERENCE_WORKER_ENABLED=false` o 
 Filas: `wager-transactions.fifo` (entrada), `wager-transactions-dlq.fifo` (falhas)
 e `wager-events.fifo` (eventos). O guia explica configuração e envelopes.
 
-| Método | Rota | Finalidade |
-| --- | --- | --- |
-| POST | /wallets | Abrir carteira |
-| GET | /wallets/:walletId | Consultar carteira |
-| POST | /wagering/transactions | Processar operações |
+| Método | Rota                                                                | Finalidade                           |
+| ------ | ------------------------------------------------------------------- | ------------------------------------ |
+| POST   | /wallets                                                            | Abrir carteira                       |
+| GET    | /wallets/:walletId                                                  | Consultar carteira                   |
+| POST   | /wagering/transactions                                              | Processar operações                  |
+| GET    | /wallets/:walletId/ledger                                           | Ledger com limit e cursor            |
+| GET    | /wagering/transactions/:transactionId                               | Consultar transação                  |
+| GET    | /providers/:providerId/wagering/transactions/:externalTransactionId | Consultar pelo ID externo            |
+| POST   | /wallets/:walletId/reconciliation                                   | Comparar saldo e ledger, sem reparar |
+| GET    | /health/live                                                        | Verificar processo                   |
+| GET    | /health/ready                                                       | Verificar PostgreSQL e as três filas |
+| GET    | /metrics                                                            | Métricas em formato Prometheus       |
 
 Exemplo de abertura:
 
@@ -65,6 +74,10 @@ Operações HTTP exigem `Idempotency-Key`. Reenviar uma operação finalizada se
 alterações recupera seu resultado histórico com `idempotentReplay: true`, sem
 nova movimentação. Conflitos retornam 409, rejeições financeiras 422 e espera
 por referência 202.
+
+O ledger usa limite padrão 50, máximo 100, e devolve nextCursor para a próxima
+página. Consultas de transações preservam o saldo histórico; a carteira mostra
+o saldo atual. Readiness verifica SQS mesmo com os workers desativados.
 
 ## Validar
 
@@ -83,13 +96,11 @@ bun run test:messaging
 e remove os dados desse banco. Rode as suítes em sequência.** A suíte SQS utiliza
 filas próprias e as remove no encerramento. Não execute workers externos nesse banco.
 
-Validação: **115 testes unitários, 55 HTTP/SQL e seis com PostgreSQL e LocalStack
-reais aprovados**, além de build e lint. Os testes atuais ainda não comprovam
-três processos independentes ou interrupção real por kill.
-
-## Guias
-
-[Abertura](GUIA-ABERTURA.md) · [Transações](GUIA-TRANSACOES.md) ·
-[Referências](GUIA-REFERENCIAS.md) · [Mensageria](GUIA-MENSAGERIA.md).
+Neste incremento, build e lint passaram; foram aprovados **117 testes unitários**
+e **62 HTTP/SQL com PGlite e transporte controlado** no ambiente de desenvolvimento.
+A suíte SQS tem sete cenários. A execução deste bloco com PostgreSQL 17 e LocalStack
+no Docker do autor ainda precisa ser confirmada. O bloco anterior havia passado
+55 testes HTTP/SQL e seis com PostgreSQL/LocalStack reais.
+Os testes atuais ainda não comprovam três processos independentes ou kill real.
 
 Desafio: [Jungle Gaming — Backend Challenge](https://github.com/junglegaming/backend-challenge).

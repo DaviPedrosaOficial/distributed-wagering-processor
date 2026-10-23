@@ -1,3 +1,4 @@
+import { WalletQueriesService } from "./application/wallet-queries.service.js";
 import { Module, ValidationPipe } from "@nestjs/common";
 import { APP_PIPE } from "@nestjs/core";
 import { OpenWalletService } from "./application/open-wallet.service.js";
@@ -7,6 +8,7 @@ import { WalletsController } from "./http/wallets.controller.js";
   controllers: [WalletsController],
   providers: [
     OpenWalletService,
+    WalletQueriesService,
     {
       provide: APP_PIPE,
       useFactory: () =>

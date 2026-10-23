@@ -5,6 +5,7 @@ export interface QueueDelivery {
   receiveCount: number;
 }
 export abstract class QueuePort {
+  abstract ready(): Promise<void>;
   abstract receive(
     queue: string,
     waitSeconds: number,

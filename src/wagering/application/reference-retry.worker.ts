@@ -1,3 +1,4 @@
+import { telemetry } from "../../operations/telemetry.js";
 import { Injectable, Logger, type OnModuleDestroy, type OnModuleInit, } from "@nestjs/common";
 import { MikroORM } from "@mikro-orm/postgresql";
 import { ReferenceScheduleRecord } from "../../database/entities/reference-schedule.record.js";
@@ -40,7 +41,8 @@ export class ReferenceRetryWorker implements OnModuleInit, OnModuleDestroy {
       );
     for (const item of due) {
       try {
-        await this.service.retryPending(item.transactionId, at);
+        if (await this.service.retryPending(item.transactionId, at))
+          telemetry.inc("wager_retries_total", { source: "reference" });
       } catch {
         this.logger.error(
           JSON.stringify({

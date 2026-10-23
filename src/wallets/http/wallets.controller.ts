@@ -1,4 +1,6 @@
-import { Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, UseFilters, } from "@nestjs/common";
+import { Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, UseFilters, Query, HttpCode, } from "@nestjs/common";
+import { WalletQueriesService } from "../application/wallet-queries.service.js";
+import { LedgerQueryDto } from "./ledger-query.dto.js";
 import { randomUUID } from "node:crypto";
 import { OpenWalletService } from "../application/open-wallet.service.js";
 import { CreateWalletDto } from "./create-wallet.dto.js";
@@ -7,7 +9,10 @@ import { WalletErrorsFilter } from "./wallets-errors.filter.js";
 @Controller("wallets")
 @UseFilters(WalletErrorsFilter)
 export class WalletsController {
-  constructor(private readonly service: OpenWalletService) {}
+  constructor(
+    private readonly service: OpenWalletService,
+    private readonly queries: WalletQueriesService,
+  ) {}
 
   @Post()
   create(
@@ -25,5 +30,20 @@ export class WalletsController {
   @Get(":walletId")
   findById(@Param("walletId", new ParseUUIDPipe()) walletId: string) {
     return this.service.findById(walletId);
+  }
+  @Get(":walletId/ledger")
+  ledger(
+    @Param("walletId", new ParseUUIDPipe()) walletId: string,
+    @Query() query: LedgerQueryDto,
+  ) {
+    return this.queries.ledger(walletId, query);
+  }
+  @Post(":walletId/reconciliation")
+  @HttpCode(200)
+  reconcile(
+    @Param("walletId", new ParseUUIDPipe()) walletId: string,
+    @Headers("x-correlation-id") correlationId?: string,
+  ) {
+    return this.queries.reconcile(walletId, correlationId ?? randomUUID());
   }
 }
