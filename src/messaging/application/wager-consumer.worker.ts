@@ -73,6 +73,21 @@ export class WagerConsumerWorker
         { messageId: parsed.messageId, consumerName: WAGER_CONSUMER_NAME },
       );
       committed = true;
+      // FAILED pode ter sido auditado antes de uma falha no envio à DLQ.
+      // Redelivery precisa concluir esse envio antes de remover a origem.
+      if (result.status === "FAILED") {
+        await this.broker.publish(
+          names.deadLetters,
+          delivery.body,
+          parsed.input.walletId,
+          createHash("sha256").update(delivery.brokerMessageId).digest("hex"),
+          {
+            failureCode: "RETRY_EXHAUSTED",
+            sourceMessageId: delivery.brokerMessageId,
+          },
+        );
+        telemetry.inc("wager_dlq_total");
+      }
       // execute só resolve após o commit que inclui a inbox.
       await this.broker.acknowledge(names.requests, delivery.receiptHandle);
       messagingLog("sqs_processed", {
@@ -100,6 +115,41 @@ export class WagerConsumerWorker
         return;
       }
       if (permanent || (!committed && delivery.receiveCount >= 5)) {
+        if (!permanent && !committed && parsed) {
+          try {
+            const audit = await this.service.recordPermanentFailure(
+              parsed.input,
+              parsed.idempotencyKey,
+              parsed.correlationId,
+              {
+                messageId: parsed.messageId,
+                consumerName: WAGER_CONSUMER_NAME,
+              },
+            );
+            // Um commit cuja resposta se perdeu pode ser encontrado aqui.
+            // Nesse caso recuperamos o resultado sem declarar uma falha falsa.
+            if (audit.status !== "FAILED") {
+              await this.broker.acknowledge(
+                names.requests,
+                delivery.receiptHandle,
+              );
+              messagingLog("sqs_recovered_result", {
+                ...context,
+                transactionId: audit.transactionId,
+                status: audit.status,
+              });
+              return;
+            }
+            messagingLog("sqs_failure_audited", {
+              ...context,
+              transactionId: audit.transactionId,
+            });
+          } catch {
+            // Banco indisponível não pode prometer auditoria SQL. A DLQ preserva
+            // o pedido para investigação; não fabricamos um registro confirmado.
+            messagingLog("sqs_failure_audit_unavailable", context);
+          }
+        }
         const dedup = createHash("sha256")
           .update(delivery.brokerMessageId)
           .digest("hex");

@@ -10,7 +10,8 @@
   "include": [
     "src/**/*.ts",
     "test/**/*.ts",
-    "test-sqs/**/*.ts"
+    "test-sqs/**/*.ts",
+    "test-process/**/*.ts"
   ],
   "exclude": [
     "node_modules",

@@ -22,6 +22,7 @@ import type { WalletLedgerEntry } from "../../wallets/domain/wallet-ledger-entry
 import { WalletBalanceChanged } from "../../wallets/domain/wallet-balance-changed.event.js";
 import { FailureCode, WagerTransaction, WagerTransactionKind as Kind, WagerTransactionStatus as Status, } from "../domain/wager-transaction.js";
 import { WagerTransactionProcessed } from "../domain/wager-transaction-processed.event.js";
+import { WagerTransactionFailed } from "../domain/wager-transaction-failed.event.js";
 import { WagerTransactionRejected } from "../domain/wager-transaction-rejected.event.js";
 import { payloadHash, type TransactionPayload } from "./transaction-payload.js";
 
@@ -72,11 +73,23 @@ export class ProcessTransactionService {
     }
   }
 
+  // Política operacional: tentativas esgotadas. Reutiliza validação, identidade,
+  // locks e inbox; nunca converte uma operação já confirmada em FAILED.
+  async recordPermanentFailure(
+    input: TransactionPayload,
+    key: string,
+    correlationId: string,
+    inbox: InboxContext,
+  ): Promise<TransactionResponse> {
+    return this.executeCore(input, key, correlationId, inbox, true);
+  }
+
   private async executeCore(
     input: TransactionPayload,
     key: string,
     correlationId: string,
     inbox?: InboxContext,
+    infrastructureFailure = false,
   ): Promise<TransactionResponse> {
     if (typeof key !== "string" || !key.trim() || key.length > 255)
       throw new BadRequestException({ code: "INVALID_IDEMPOTENCY_KEY" });
@@ -155,6 +168,15 @@ export class ProcessTransactionService {
           payloadHash: hash,
           createdAt: at,
         });
+        if (infrastructureFailure) {
+          transaction.fail(FailureCode.PermanentInfrastructureFailure);
+          return this.completeInbox(
+            em,
+            inbox,
+            inboxHash,
+            await this.persistFailure(em, transaction, correlationId, at),
+          );
+        }
         const result = await this.apply(
           em,
           record,
@@ -183,7 +205,13 @@ export class ProcessTransactionService {
           const result = this.replay(existing, key, hash);
           // Reentra após o rollback para confirmar inbox e replay juntos.
           return inbox
-            ? this.executeCore(input, key, correlationId, inbox)
+            ? this.executeCore(
+                input,
+                key,
+                correlationId,
+                inbox,
+                infrastructureFailure,
+              )
             : result;
         }
       }
@@ -213,6 +241,44 @@ export class ProcessTransactionService {
         throw new BadRequestException({ code: "MONETARY_LIMIT_EXCEEDED" });
       throw error;
     }
+  }
+
+  private async persistFailure(
+    em: EntityManager,
+    transaction: WagerTransaction,
+    correlationId: string,
+    at: Date,
+  ): Promise<TransactionResponse> {
+    const record = transactionToRecord(transaction);
+    const event = WagerTransactionFailed.create({
+      eventId: randomUUID(),
+      aggregateId: transaction.walletId,
+      correlationId,
+      causationId: transaction.id,
+      occurredAt: at,
+      data: {
+        transactionId: transaction.id,
+        walletId: transaction.walletId,
+        providerId: transaction.providerId,
+        externalTransactionId: transaction.externalTransactionId,
+        failureCode: FailureCode.PermanentInfrastructureFailure,
+      },
+    }).toJSON();
+    em.persist(record);
+    em.persist(
+      Object.assign(new OutboxRecord(), {
+        id: event.eventId,
+        aggregateId: transaction.walletId,
+        eventType: event.eventType,
+        payload: event,
+        occurredAt: at,
+        attempts: 0,
+        nextAttemptAt: null,
+        publishedAt: null,
+      }),
+    );
+    await em.flush();
+    return this.response(record, false);
   }
 
   private async completeInbox(

@@ -1,31 +1,15 @@
+import { WAGER_CONSUMER_NAME } from "../src/messaging/application/wager-consumer.worker.js";
+import { FailureCode } from "../src/wagering/domain/wager-transaction.js";
 import "reflect-metadata";
 import { OperationsModule } from "../src/operations/operations.module.js";
 import { MessagingModule } from "../src/messaging/messaging.module.js";
 import { InboxRecord } from "../src/database/entities/inbox.record.js";
-import { QueuePort, type QueueDelivery, } from "../src/messaging/application/queue.port.js";
+import {
+  QueuePort,
+  type QueueDelivery,
+} from "../src/messaging/application/queue.port.js";
 import { WagerConsumerWorker } from "../src/messaging/application/wager-consumer.worker.js";
 import { OutboxPublisherWorker } from "../src/messaging/application/outbox-publisher.worker.js";
-import { ProcessTransactionService } from "../src/wagering/application/process-transaction.service.js";
-import { ReferenceRetryWorker } from "../src/wagering/application/reference-retry.worker.js";
-import { ReferenceScheduleRecord } from "../src/database/entities/reference-schedule.record.js";
-import { WageringModule } from "../src/wagering/wagering.module.js";
-import { afterAll, beforeAll, describe, expect, test, setSystemTime, } from "bun:test";
-import { Test } from "@nestjs/testing";
-import type { INestApplication } from "@nestjs/common";
-import { MikroOrmModule } from "@mikro-orm/nestjs";
-import { MikroORM } from "@mikro-orm/postgresql";
-import { integrationConfig } from "./integration-config.js";
-import { WalletsModule } from "../src/wallets/wallets.module.js";
-import { WalletRecord } from "../src/database/entities/wallet.record.js";
-import { WalletLedgerRecord } from "../src/database/entities/wallet-ledger.record.js";
-import { WagerTransactionRecord } from "../src/database/entities/wager-transaction.record.js";
-import { OutboxRecord } from "../src/database/entities/outbox.record.js";
-import { transactionFromRecord } from "../src/database/mappers/financial-records.mapper.js";
-import { WagerTransactionKind, WagerTransactionStatus, } from "../src/wagering/domain/wager-transaction.js";
-import { LedgerDirection } from "../src/wallets/domain/wallet-ledger-entry.js";
-import { OpenWalletService } from "../src/wallets/application/open-wallet.service.js";
-import { randomUUID } from "node:crypto";
-import request from "supertest";
 
 class RecordingQueue extends QueuePort {
   failReady = false;
@@ -65,6 +49,38 @@ class RecordingQueue extends QueuePort {
     this.delays.push(seconds);
   }
 }
+
+import { ProcessTransactionService } from "../src/wagering/application/process-transaction.service.js";
+import { ReferenceRetryWorker } from "../src/wagering/application/reference-retry.worker.js";
+import { ReferenceScheduleRecord } from "../src/database/entities/reference-schedule.record.js";
+import { WageringModule } from "../src/wagering/wagering.module.js";
+import {
+  afterAll,
+  beforeAll,
+  describe,
+  expect,
+  test,
+  setSystemTime,
+} from "bun:test";
+import { Test } from "@nestjs/testing";
+import type { INestApplication } from "@nestjs/common";
+import { MikroOrmModule } from "@mikro-orm/nestjs";
+import { MikroORM } from "@mikro-orm/postgresql";
+import { randomUUID } from "node:crypto";
+import request from "supertest";
+import { integrationConfig } from "./integration-config.js";
+import { WalletsModule } from "../src/wallets/wallets.module.js";
+import { WalletRecord } from "../src/database/entities/wallet.record.js";
+import { WalletLedgerRecord } from "../src/database/entities/wallet-ledger.record.js";
+import { WagerTransactionRecord } from "../src/database/entities/wager-transaction.record.js";
+import { OutboxRecord } from "../src/database/entities/outbox.record.js";
+import { transactionFromRecord } from "../src/database/mappers/financial-records.mapper.js";
+import {
+  WagerTransactionKind,
+  WagerTransactionStatus,
+} from "../src/wagering/domain/wager-transaction.js";
+import { LedgerDirection } from "../src/wallets/domain/wallet-ledger-entry.js";
+import { OpenWalletService } from "../src/wallets/application/open-wallet.service.js";
 
 process.env.REFERENCE_WORKER_ENABLED = "false";
 process.env.MESSAGING_ENABLED = "false";
@@ -1486,5 +1502,149 @@ describe("Carteiras e operações (integração PostgreSQL)", () => {
       .expect(200);
     expect(ledger.body.items).toEqual([]);
     expect(ledger.body.nextCursor).toBeNull();
+  });
+  test("esgotamento auditável mantém saldo, inbox, evento FAILED e replay terminal", async () => {
+    const wallet = await open(),
+      input = operation(wallet);
+    const item = delivery(input);
+    const parsed = JSON.parse(item.body) as { messageId: string };
+    const service = app.get(ProcessTransactionService);
+    const context = {
+      messageId: parsed.messageId,
+      consumerName: WAGER_CONSUMER_NAME,
+    };
+    const key = `provider-a:${input.externalTransactionId}`;
+    const result = await service.recordPermanentFailure(
+      { ...input, kind: WagerTransactionKind.Bet },
+      key,
+      randomUUID(),
+      context,
+    );
+    expect(result.status).toBe(WagerTransactionStatus.Failed);
+    expect(result.failureCode).toBe(FailureCode.PermanentInfrastructureFailure);
+    const replay = await submit(input).expect(500);
+    expect(replay.body.transactionId).toBe(result.transactionId);
+    expect(replay.body.idempotentReplay).toBe(true);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("100.00");
+    const em = orm.em.fork();
+    expect(
+      await em.count(WalletLedgerRecord, {
+        transactionId: result.transactionId,
+      }),
+    ).toBe(0);
+    expect(await em.count(InboxRecord, context)).toBe(1);
+    expect(
+      await em.count(OutboxRecord, {
+        aggregateId: wallet.walletId,
+        eventType: "WagerTransactionFailed",
+      }),
+    ).toBe(1);
+    const repeated = await service.recordPermanentFailure(
+      { ...input, kind: WagerTransactionKind.Bet },
+      key,
+      randomUUID(),
+      context,
+    );
+    expect(repeated.idempotentReplay).toBe(true);
+  });
+  test("auditoria tardia recupera sucesso confirmado sem convertê-lo em FAILED", async () => {
+    const wallet = await open(),
+      input = operation(wallet);
+    const success = await submit(input).expect(200);
+    const result = await app
+      .get(ProcessTransactionService)
+      .recordPermanentFailure(
+        { ...input, kind: WagerTransactionKind.Bet },
+        `provider-a:${input.externalTransactionId}`,
+        randomUUID(),
+        { messageId: randomUUID(), consumerName: WAGER_CONSUMER_NAME },
+      );
+    expect(result.transactionId).toBe(success.body.transactionId);
+    expect(result.status).toBe(WagerTransactionStatus.Processed);
+    expect(result.idempotentReplay).toBe(true);
+    expect(
+      await orm.em
+        .fork()
+        .count(WagerTransactionRecord, {
+          walletId: wallet.walletId,
+          status: WagerTransactionStatus.Failed,
+        }),
+    ).toBe(0);
+  });
+
+  test("consumidor audita FAILED antes da DLQ quando tentativas esgotam e banco responde", async () => {
+    const wallet = await open(),
+      input = operation(wallet);
+    const broker = new RecordingQueue();
+    const service = app.get(ProcessTransactionService);
+    const execute = service.execute.bind(service);
+    service.execute = async () => {
+      throw new Error("Falha operacional simulada");
+    };
+    try {
+      await new WagerConsumerWorker(broker, service).handle({
+        ...delivery(input),
+        receiveCount: 5,
+      });
+    } finally {
+      service.execute = execute;
+    }
+    const failed = await orm.em
+      .fork()
+      .findOneOrFail(WagerTransactionRecord, {
+        externalTransactionId: input.externalTransactionId,
+      });
+    expect(failed.status).toBe(WagerTransactionStatus.Failed);
+    expect(broker.sent).toHaveLength(1);
+    expect(broker.acknowledgements).toBe(1);
+    expect(
+      await orm.em
+        .fork()
+        .count(WalletLedgerRecord, { transactionId: failed.id }),
+    ).toBe(0);
+    expect(
+      (await api().get(`/wallets/${wallet.walletId}`)).body.balance.amount,
+    ).toBe("100.00");
+  });
+
+  test("redelivery de FAILED conclui DLQ se o primeiro envio falhar", async () => {
+    const wallet = await open(),
+      input = operation(wallet),
+      item = delivery(input);
+    const broker = new RecordingQueue();
+    broker.failPublish = true;
+    const service = app.get(ProcessTransactionService),
+      execute = service.execute.bind(service);
+    service.execute = async () => {
+      throw new Error("Falha operacional simulada");
+    };
+    const consumer = new WagerConsumerWorker(broker, service);
+    let publishFailed = false;
+    try {
+      await consumer.handle({ ...item, receiveCount: 5 });
+    } catch {
+      publishFailed = true;
+    } finally {
+      service.execute = execute;
+    }
+    expect(publishFailed).toBe(true);
+    expect(broker.acknowledgements).toBe(0);
+    broker.failPublish = false;
+    await consumer.handle({ ...item, receiveCount: 6 });
+    expect(broker.sent).toHaveLength(1);
+    expect(broker.acknowledgements).toBe(1);
+    const failed = await orm.em
+      .fork()
+      .findOneOrFail(WagerTransactionRecord, {
+        externalTransactionId: input.externalTransactionId,
+      });
+    expect(failed.status).toBe(WagerTransactionStatus.Failed);
+    expect(
+      await orm.em
+        .fork()
+        .count(WalletLedgerRecord, { transactionId: failed.id }),
+    ).toBe(0);
   });
 });

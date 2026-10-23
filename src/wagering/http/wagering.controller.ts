@@ -1,3 +1,5 @@
+import { UseGuards } from "@nestjs/common";
+import { ProviderAuthGuard } from "../../shared/http/provider-auth.guard.js";
 import { Body, Controller, Headers, Post, Res, Get, Param, ParseUUIDPipe, } from "@nestjs/common";
 import type { Response } from "express";
 import { TransactionQueriesService } from "../application/transaction-queries.service.js";
@@ -6,6 +8,7 @@ import { ProcessTransactionService } from "../application/process-transaction.se
 import { WagerTransactionStatus } from "../domain/wager-transaction.js";
 import { SubmitTransactionDto } from "./submit-transaction.dto.js";
 
+@UseGuards(ProviderAuthGuard)
 @Controller("wagering/transactions")
 export class WageringController {
   constructor(
@@ -27,9 +30,11 @@ export class WageringController {
     response.status(
       result.status === WagerTransactionStatus.PendingReference
         ? 202
-        : result.status === WagerTransactionStatus.Rejected
-          ? 422
-          : 200,
+        : result.status === WagerTransactionStatus.Failed
+          ? 500
+          : result.status === WagerTransactionStatus.Rejected
+            ? 422
+            : 200,
     );
     response.setHeader("X-Correlation-Id", correlationId);
     return result;

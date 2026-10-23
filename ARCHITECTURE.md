@@ -1,13 +1,17 @@
 # Decisões de arquitetura
 
-Revisado em 23/10/2026, incluindo consultas, reconciliação e diagnóstico.
+Revisado em 23/10/2026, incluindo consultas, diagnóstico e fechamento de recuperação de falhas.
 
 Este documento registra as decisões já adotadas no Distributed Wagering Processor,
 suas justificativas, trade-offs e limitações. A referência é o
 [enunciado do desafio](https://github.com/junglegaming/backend-challenge).
 Os comandos de preparação e execução estão no [README.md](README.md).
+O [Mapa do Sistema](MAPA-DO-SISTEMA.md) relaciona cada seção abaixo aos arquivos
+responsáveis, com um resumo de sua implementação e das ligações entre componentes.
 
 ## 1. ORM e separação do domínio
+
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#1-orm-e-separação-do-domínio).
 
 Escolhi MikroORM com PostgreSQL por oferecer EntityManager e Unit of Work e por
 ser a opção preferida no desafio. TypeORM também seria uma alternativa aceita.
@@ -28,6 +32,8 @@ Work. Ele não substitui transações SQL nem resolve a disputa pelo saldo entre
 requisições concorrentes.
 
 ## 2. Money e precisão monetária
+
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#2-money-e-precisão-monetária).
 
 Adotei strings decimais com exatamente duas casas na entrada e na saída e
 `decimal.js` nos cálculos. Dinheiro não é convertido para `number`.
@@ -52,6 +58,8 @@ preserva a representação textual ao atravessar o ORM. O mapper reconstrói Mon
 antes de entregar valores ao domínio.
 
 ## 3. Abertura, processamento e unidade transacional
+
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#3-abertura-processamento-e-unidade-transacional).
 
 Wallet concentra as regras de saldo. Créditos e débitos exigem valor positivo e
 moeda compatível; débitos sem saldo são rejeitados. Cada movimentação valida seu
@@ -108,6 +116,8 @@ transição de estado e eventos também participam da mesma transação SQL.
 
 ## 4. Garantias no PostgreSQL e imutabilidade do ledger
 
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#4-garantias-no-postgresql-e-imutabilidade-do-ledger).
+
 Defini unicidade por jogador e moeda para carteiras, por chave de idempotência e
 por provedor e ID externo para transações, e por transação e carteira no ledger.
 As chaves estrangeiras preservam os vínculos entre registros. Os índices compostos
@@ -142,6 +152,8 @@ trigger valida o vínculo de uma referência processada com a identidade externa
 contexto, tipo permitido e valor integral quando aplicável.
 
 ## 5. Estados, referências e códigos de falha
+
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#5-estados-referências-e-códigos-de-falha).
 
 WagerTransaction nasce em PENDING. Os métodos públicos controlam as transições:
 
@@ -189,8 +201,9 @@ Os códigos declarados em FailureCode são:
 reject() registra rejeição de negócio; fail() registra falha permanente. Ambos
 validam a existência do código no enum, mas ainda não restringem seus membros por
 categoria. O fluxo integrado utiliza os códigos de negócio acima.
-PERMANENT_INFRASTRUCTURE_FAILURE permanece declarado no domínio; ainda não há
-classificação operacional integrada que finalize transações com esse código.
+Ao esgotar as cinco tentativas na entrada SQS, a política operacional utiliza
+PERMANENT_INFRASTRUCTURE_FAILURE, conforme a seção 10. Essa classificação por
+esgotamento é uma decisão da aplicação, não prova de que a dependência jamais voltará.
 
 ### Espera persistida e política de reprocessamento
 
@@ -228,6 +241,8 @@ Os hooks de desligamento interrompem novas varreduras e aguardam a ativa.
 Esse worker possui ciclo de vida separado dos workers SQS descritos na seção 7.
 
 ## 6. Resultado histórico e identidade da operação
+
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#6-resultado-histórico-e-identidade-da-operação).
 
 markProcessed() recebe o saldo observado no processamento, verifica sua moeda e
 não-negatividade e o preserva como Money imutável. O valor é persistido em
@@ -274,6 +289,8 @@ vencedora. A execução perdedora sofre rollback e consulta o registro confirmad
 com outro EntityManager, pois a transação abortada não pode ser reutilizada.
 
 ## 7. Mensageria, inbox e publicação da outbox
+
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#7-mensageria-inbox-e-publicação-da-outbox).
 
 ### Transporte e filas
 
@@ -344,8 +361,8 @@ do broker oferece proteção quando a instância falha antes do encaminhamento.
 
 Falha apenas no ack após commit mantém a inbox confirmada e permite redelivery
 seguro; não transforma o resultado financeiro em uma nova falha. Mensagens na
-DLQ são preservadas, mas ainda não há retomada administrativa nem criação
-automática de WagerTransaction FAILED para toda falha permanente de infraestrutura.
+DLQ são preservadas. O registro automático de FAILED quando o banco responde está
+detalhado na seção 10; não há retomada administrativa automática da DLQ.
 
 ### Eventos e publicador concorrente
 
@@ -395,6 +412,8 @@ na seção 9. Os logs padrão de inicialização do Nest mantêm o formato do fr
 
 ## 8. Contratos HTTP e classificação dos resultados
 
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#8-contratos-http-e-classificação-dos-resultados).
+
 DTOs validam UUID, formato monetário e campos permitidos. A validação de entrada
 complementa as regras de Money; não as substitui. O filtro traduz os erros
 conhecidos de criação e consulta:
@@ -413,7 +432,8 @@ prévia, isoladamente, não impediria duas inserções concorrentes.
 
 O X-Correlation-Id é aceito dentro do formato limitado do controller ou substituído
 por um UUID gerado. Esse identificador correlaciona os eventos; não é chave de
-idempotência nem autorização. Os endpoints atuais não possuem autenticação.
+idempotência nem autorização. Os endpoints financeiros utilizam ProviderAuthGuard no-op: o ponto de extensão
+está explícito, mas ainda não autentica nem autoriza chamadas.
 POST /wagering/transactions aceita BET, WIN, LOSS, REFUND e ROLLBACK.
 OPENING é exclusivamente interno e o identificador de provedor `__internal__` é
 reservado. Os DTOs validam referências opcionais quando presentes, rejeitando
@@ -428,15 +448,18 @@ null; o serviço exige referência para as reversões.
 | Conflito de idempotência ou identidade externa | 409 |
 | Rejeição financeira persistida ou seu replay | 422 |
 | Falha transitória de banco reconhecida | 503 |
+| Replay de FAILED terminal, com failureCode persistido | 500 |
 | Falha inesperada | 500 |
 
 O serviço traduz exceções de conexão e os SQLSTATE 40001, 40P01, 55P03, 57014,
 57P01, 57P02 e 57P03 em TRANSIENT_DATABASE_FAILURE. Erros inesperados são
 propagados e provocam rollback. O filtro global também traduz exceções do driver SQL em 503 quando transitórias
-ou 500 nos demais casos, sem expor SQL. Autenticação e seu ponto de extensão continuam
-pendentes; verificar o playerId não comprova a identidade de quem chama a API.
+ou 500 nos demais casos, sem expor SQL. A decisão de não implementar autenticação e seu ponto de extensão estão na
+seção 10; verificar playerId não comprova a identidade de quem chama a API.
 
 ## 9. Consultas, reconciliação e observabilidade — 23/10/2026
+
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#9-consultas-reconciliação-e-observabilidade).
 
 ### Consultas e paginação do ledger
 
@@ -499,45 +522,138 @@ identidade autenticada nem chave de idempotência.
 
 Essas decisões não exigiram migration, alteração de schema ou dependência nova.
 
-## 10. Validação e limites conhecidos
+## 10. Autenticação e recuperação operacional — 23/10/2026
 
-Neste bloco, build e lint passaram, assim como 117 testes unitários e 62 HTTP/SQL
-com PGlite e transporte controlado no ambiente de desenvolvimento. A suíte SQS
-agora possui sete cenários, incluindo readiness real. A confirmação deste incremento
-com PostgreSQL 17 e LocalStack no Docker do autor permanece pendente; o bloco
-anterior passou 55 HTTP/SQL e seis cenários com essas dependências reais.
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#10-autenticação-e-recuperação-operacional).
 
-Os novos testes cobrem datas iguais na paginação, cursor inválido ou de outra
-carteira, saldo histórico nas consultas, reconciliação durante movimentações,
-divergência detectada sem reparo, correlação, métricas e readiness indisponível.
+### Autenticação deixada como extensão explícita
 
-Os testes cobrem migrations reversíveis, constraints, abertura e versão inicial,
-precisão monetária, operações, referências, replay e rollback. No reprocessamento,
-verificam backoff, expiração e falha da outbox; o relógio explícito evita esperar
-o TTL nos testes.
+Optei por não integrar um IdP no tempo do desafio, priorizando correção financeira,
+concorrência e recuperação, conforme a opção aceita no enunciado. ProviderAuthGuard
+está aplicado aos três controllers financeiros e registrado em seus módulos.
+É deliberadamente no-op: permite chamadas e não valida identidade. Não criei
+tabela de usuários, senha ou autenticação artesanal. Esse ponto não torna a API
+segura para exposição pública.
 
-A suíte HTTP/SQL usa transporte controlado para provocar falhas de ack, inbox,
-outbox e publicação. Verifica rollback de todas as gravações se a inbox falhar,
-seleção concorrente de publishers, repetição do mesmo eventId após falha na
-marcação e desligamento aguardando confirmação ativa.
+O desenho adotado como extensão é um IdP externo OIDC, por exemplo Keycloak,
+validando assinatura por JWKS, issuer, audience e expiração do token. Uma claim
+confiável identificaria o provedor, que precisaria corresponder ao providerId do
+pedido ou da rota. Consultas por carteira/ID interno também exigiriam autorização
+sobre o recurso, não apenas token válido. Não implementei esse desenho: o guard
+indica onde iniciar sua integração. Health permanece aberto e SQS é canal interno,
+com os mesmos controles de contexto e regras de domínio.
 
-A suíte real SQS verifica redelivery físico com mesmo messageId, janela commit/ack
-retomada por outro consumidor, mensagem inválida em DLQ, ack de rejeição de saldo,
-retry até DLQ e dois publishers enviando eventos. Esses cenários passaram em
-22/10/2026. A janela de falha é simulada; não foi provocada matando um processo.
+### Esgotamento de retries, FAILED e DLQ
 
-Os cenários de saldo incluem duas apostas de 80.00 disputando 100.00, cinquenta
-pedidos da mesma operação e colisão de chave entre carteiras. São chamadas
-concorrentes e objetos de worker na mesma execução de teste. Ainda faltam três
-processos independentes, kill real após commit antes de ack e recuperação após
-interrupção real de publicador/serviço. Não apresento recriação de objeto como
-prova de reinício de processo.
+Adotei cinco recebimentos para encerrar retries da mensagem SQS. Após uma falha
+operacional sem resultado devolvido, o quinto recebimento chama
+recordPermanentFailure(). Ele reutiliza validações, identidade, hash, locks e
+confirmação de inbox do processamento, mas não executa movimentações financeiras.
+
+O serviço primeiro verifica inbox e transação existentes. Se uma tentativa confirmou
+o commit e perdeu sua resposta, recupera esse resultado, sem mudar sucesso em falha.
+Uma operação já em espera mantém seu agendamento independente. Apenas uma operação
+nova e válida é criada e finalizada em FAILED com
+PERMANENT_INFRASTRUCTURE_FAILURE. Transação, inbox e WagerTransactionFailed na
+outbox são atômicos. Não há ledger nem incremento da versão. Resultado terminal
+permanece imutável; replay HTTP retorna 500 com status FAILED e código persistido,
+distinto de indisponibilidade transitória 503.
+
+Após registrar FAILED, o consumidor publica o pedido original na DLQ e só então
+remove a origem. Se esse envio falhar, a redelivery reconhece FAILED pela inbox,
+repete o envio à DLQ com a mesma identidade de deduplicação e tenta o ack. Isso
+evita perder a mensagem entre auditoria SQL e DLQ. Como banco e SQS não compartilham
+transação, continuam possíveis repetições no transporte.
+
+Se o banco estiver indisponível, ou impedir também a gravação da falha/outbox, não
+há como prometer auditoria SQL. O consumidor preserva o pedido na DLQ e registra
+sqs_failure_audit_unavailable, sem declarar um registro inexistente. Não há worker
+que reconcilie automaticamente a DLQ para SQL; a investigação é manual. Mensagens
+inválidas vão à DLQ sem inventar uma WagerTransaction válida. A outbox continua
+retentando sem descarte, pois seus eventos financeiros já estão confirmados.
+
+### Provas com processos separados
+
+A suíte test:recovery inicia processos Bun independentes com o código compilado.
+Três APIs utilizam portas livres e compartilham apenas PostgreSQL e broker.
+São verificados disputa de saldo, 50 repetições, carteiras distintas e replay após
+encerrar e recriar uma API, sempre confrontando saldo e ledger.
+
+As fixtures usam o consumidor e o publicador reais com um adaptador SQS derivado
+somente para pausar em fronteiras específicas. Na primeira, execute() já confirmou
+a inbox e a execução para antes de DeleteMessage. Na segunda, SendMessage já foi
+aceito e a transação de marcação da outbox permanece aberta. O processo é encerrado
+à força; outra instância retoma o trabalho. Não há flags de falha na API de produção.
+No teste de publishers, uma barreira de início mantém ambos vivos antes de liberar
+seu trabalho. A referência fora de ordem é retomada por um worker independente
+após a morte da API que recebeu a operação pendente.
+
+O teste de publicação também força duas entregas do mesmo eventId com identidades
+de transporte distintas, evitando depender da janela FIFO. Um consumidor
+exclusivo da suíte insere recibo e aplica um efeito demonstrativo na mesma transação;
+a unicidade durável do eventId permite apenas uma aplicação. São tabelas de teste,
+não novas tabelas/migrations ou um consumidor de negócio da aplicação.
+
+Esses testes requerem PostgreSQL e LocalStack reais. Compilar as fixtures ou
+executá-las com PGlite só verifica funcionamento auxiliar, não comprova os locks
+ou a recuperação distribuída exigidos no desafio.
+
+## 11. Validação e limites conhecidos
+
+Implementação: [arquivos e responsabilidades](MAPA-DO-SISTEMA.md#11-validação-e-limites-conhecidos).
+
+Validação registrada em 23/10/2026:
+
+| Suíte | Resultado | Ambiente |
+| --- | --- | --- |
+| Unitários | 117 aprovados, zero falhas | Bun 1.4.3, desenvolvimento local |
+| HTTP/SQL | 66 aprovados, zero falhas | Windows, PostgreSQL 17 em Docker e transporte controlado |
+| Mensageria | 7 aprovados, zero falhas | Windows, PostgreSQL e LocalStack em Docker |
+| Processos e recuperação | 4 aprovados, zero falhas | Windows, processos Bun separados, PostgreSQL e LocalStack em Docker |
+
+Build e lint passaram no ambiente de desenvolvimento. PGlite também foi utilizado
+como apoio durante a implementação, mas não é apresentado como substituto das
+execuções em PostgreSQL e SQS reais confirmadas acima.
+
+Os testes unitários cobrem precisão monetária, regras e invariantes do domínio,
+estados, identidade de payload e políticas de retry. A suíte HTTP/SQL verifica
+migrations reversíveis, constraints, abertura com versão 1, operações, referências,
+replay e rollback. Usa transporte controlado para provocar falhas em inbox, outbox,
+ack e publicação, verificando atomicidade e recuperação. Também cobre paginação,
+resultado histórico, reconciliação concorrente, correlação, métricas, readiness e
+registro de FAILED sem movimento financeiro.
+
+Os sete casos de mensageria exercitam filas reais: redelivery com o mesmo messageId,
+retomada após commit sem ack, mensagem inválida em DLQ, ack de rejeição financeira,
+retry até DLQ, publicadores concorrentes e readiness. A janela commit/ack nessa
+suíte é simulada; a prova com encerramento de processo fica na suíte seguinte.
+
+Os quatro cenários de processos e recuperação passaram em 23/10/2026:
+
+1. Três APIs independentes disputaram saldo; 50 repetições produziram um débito,
+   carteiras distintas avançaram e o replay funcionou após reiniciar uma API.
+2. Um consumidor foi encerrado após commit e antes de ack. Outra instância recebeu
+   a mensagem após a visibilidade de 30 segundos, sem novo débito ou incremento de versão.
+3. Um publicador foi encerrado após envio ao SQS e antes de confirmar a marcação.
+   Dois processos retomaram a outbox. Entregas repetidas do mesmo eventId produziram
+   somente um efeito no consumidor demonstrativo com deduplicação persistida.
+4. Uma operação aguardando referência sobreviveu à morte da API; outro processo
+   resolveu a pendência e manteve o ID original e a consistência financeira.
+
+A suíte de processos confronta os saldos com o ledger nos cenários exercitados.
+Não trata recriar um objeto como reiniciar um processo. Os pontos de pausa são
+exclusivos das fixtures; não há comandos de interrupção no código de produção.
+A demonstração de deduplicação de eventos usa tabelas exclusivas de teste e não
+representa um consumidor de negócio implementado na aplicação.
 
 POSTGRES_TEST_DB deve apontar para banco exclusivo terminado em _test. A suíte
-HTTP/SQL reverte e reaplica migrations nele. A suíte SQS cria filas com nomes
-únicos e as remove ao finalizar. As suítes que compartilham esse banco devem
-rodar em sequência, sem workers externos usando o banco de testes.
+HTTP/SQL reverte e reaplica migrations nele. As suítes SQS e de recuperação criam
+filas próprias e as removem ao finalizar. As suítes devem rodar em sequência, sem
+workers externos usando o banco de testes.
 
-Autenticação/ponto de extensão e classificação operacional completa de FAILED
-continuam pendentes, além das provas com processos e interrupções reais descritas
-acima. Não há alegação de atendimento integral do desafio.
+Limitações assumidas: autenticação permanece desativada com extensão explícita;
+não há recuperação automática da auditoria SQL a partir da DLQ nem consumidor de
+negócio dos eventos. Métricas por processo reiniciam com a instância, não há garantia
+de ordem global de publicação e a paginação não congela um snapshot entre páginas.
+Não foram realizados teste de carga, dashboard ou integração OpenTelemetry.
+Os resultados confirmam os cenários descritos; não são uma certificação de produção.

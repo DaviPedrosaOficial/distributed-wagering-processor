@@ -1,3 +1,4 @@
+import { ProviderAuthGuard } from "../shared/http/provider-auth.guard.js";
 import { WalletQueriesService } from "./application/wallet-queries.service.js";
 import { Module, ValidationPipe } from "@nestjs/common";
 import { APP_PIPE } from "@nestjs/core";
@@ -7,6 +8,7 @@ import { WalletsController } from "./http/wallets.controller.js";
 @Module({
   controllers: [WalletsController],
   providers: [
+    ProviderAuthGuard,
     OpenWalletService,
     WalletQueriesService,
     {

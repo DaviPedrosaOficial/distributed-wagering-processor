@@ -11,7 +11,7 @@
     "format": "prettier --write \"src/**/*.ts\" \"test/**/*.ts\"",
     "start": "bun run build && bun ./dist/main.js",
     "start:prod": "bun ./dist/main.js",
-    "lint": "oxlint --type-aware src/ test/ test-sqs/ scripts/",
+    "lint": "oxlint --type-aware src/ test/ test-sqs/ test-process/ scripts/",
     "test:clean": "bun -e \"require('node:fs').rmSync('dist-test', { recursive: true, force: true })\"",
     "test:build": "bun run test:clean && tsc -p tsconfig.test.json",
     "test": "bun run test:unit",
@@ -25,7 +25,8 @@
     "test:integration": "bun run test:build && bun test ./dist-test/test/wallets.integration.spec.js",
     "db:test:prepare": "bun ./scripts/prepare-test-database.ts",
     "queues:setup": "bun ./scripts/setup-queues.ts",
-    "test:messaging": "bun run test:build && bun test ./dist-test/test-sqs"
+    "test:messaging": "bun run test:build && bun test ./dist-test/test-sqs",
+    "test:recovery": "bun run test:build && bun test ./dist-test/test-process"
   },
   "dependencies": {
     "@aws-sdk/client-sqs": "^3.1156.0",

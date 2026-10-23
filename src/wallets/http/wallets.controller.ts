@@ -1,3 +1,5 @@
+import { UseGuards } from "@nestjs/common";
+import { ProviderAuthGuard } from "../../shared/http/provider-auth.guard.js";
 import { Body, Controller, Get, Headers, Param, ParseUUIDPipe, Post, UseFilters, Query, HttpCode, } from "@nestjs/common";
 import { WalletQueriesService } from "../application/wallet-queries.service.js";
 import { LedgerQueryDto } from "./ledger-query.dto.js";
@@ -6,6 +8,7 @@ import { OpenWalletService } from "../application/open-wallet.service.js";
 import { CreateWalletDto } from "./create-wallet.dto.js";
 import { WalletErrorsFilter } from "./wallets-errors.filter.js";
 
+@UseGuards(ProviderAuthGuard)
 @Controller("wallets")
 @UseFilters(WalletErrorsFilter)
 export class WalletsController {
