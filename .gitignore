@@ -16,3 +16,7 @@
 
 # Logs
 *.log
+
+# Materiais locais de estudo e transferência
+GUIA-*.md
+*.zip
