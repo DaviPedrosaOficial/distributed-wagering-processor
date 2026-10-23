@@ -219,10 +219,10 @@ na confirmação de publicação. Isso não substitui um broker real.
 
 A suíte test:messaging exige PostgreSQL e LocalStack reais e possui seis cenários:
 redelivery físico, janela commit/ack, mensagem inválida em DLQ, rejeição de negócio,
-retry até DLQ e dois publishers enviando eventos. Ela ainda não foi executada no
-ambiente do assistente, onde Docker não está disponível.
+retry até DLQ e dois publishers enviando eventos. Os seis cenários foram aprovados em
+22/10/2026 no ambiente local com PostgreSQL e LocalStack em Docker. No ambiente
+do assistente, os testes SQL utilizaram PGlite e transporte controlado.
 
 Ainda faltam os testes com três processos independentes, kill real após commit
 antes de ack, interrupção de publicador e recuperação completa. As simulações
-atuais não são apresentadas como prova desses cenários. README e ARCHITECTURE
-serão atualizados após a revisão e a validação deste incremento.
+atuais não são apresentadas como prova desses cenários. README e ARCHITECTURE registram essas decisões e os limites da validação.

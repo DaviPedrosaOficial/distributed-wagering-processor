@@ -1,58 +1,58 @@
 # Distributed Wagering Processor
 
-Serviço financeiro para processamento de operações de apostas, desenvolvido como
-parte do desafio técnico de **Backend Developer da Jungle Gaming**.
+Serviço financeiro desenvolvido para o desafio técnico de **Backend Developer da
+Jungle Gaming**. O objetivo é processar apostas com precisão monetária, impedir
+movimentações duplicadas e manter saldo, histórico e eventos consistentes.
+O projeto também consolida meu aprendizado de domínio, concorrência e recuperação
+de falhas, com decisões justificadas em [ARCHITECTURE.md](ARCHITECTURE.md).
 
-O objetivo é construir uma solução que preserve a precisão dos valores e a
-consistência entre saldo, transações e histórico financeiro. O projeto também
-serve como experiência prática de modelagem de domínio, persistência e tratamento
-de falhas, com decisões justificadas ao longo do desenvolvimento.
+## Tecnologias e funcionalidades
 
-## Tecnologias
+TypeScript estrito, NestJS, Bun 1.x, MikroORM, PostgreSQL 17, decimal.js e SQS via
+AWS SDK/LocalStack, com infraestrutura local em Docker Compose.
 
-TypeScript em modo estrito, NestJS, Bun, MikroORM, PostgreSQL 17, decimal.js e
-Docker Compose.
+- Abertura de carteira com versão 1, ledger e operação interna OPENING.
+- BET, WIN, LOSS, REFUND e ROLLBACK pela API e pelo mesmo processamento via SQS.
+- Dinheiro em strings decimais, bloqueio por carteira e idempotência persistida.
+- Replay histórico, referências validadas e espera com backoff e TTL de 15 minutos.
+- Inbox, finanças e outbox atômicas; ack após commit, retry e DLQ.
+- Publicador da outbox com seleção concorrente e eventos versionados.
 
-## Funcionalidades implementadas
-
-- Valores monetários imutáveis, com precisão decimal e validação de moeda.
-- Regras de carteira, lançamentos financeiros e estados das transações.
-- Abertura e consulta de carteiras pela API HTTP.
-- Abertura positiva com OPENING, ledger e eventos da outbox no mesmo commit,
-  preservando a versão inicial `1`.
-- Processamento HTTP de BET, WIN, LOSS, REFUND e ROLLBACK com bloqueio por carteira.
-- Referências validadas e espera persistida com reprocessamento agendado e TTL.
-- Idempotência persistida, comparação de payload e replay do resultado histórico.
-- Saldo, transação, ledger e outbox gravados atomicamente, com rejeições auditáveis.
-- Restrições de integridade no PostgreSQL.
-
-O projeto está em desenvolvimento. Integração SQS,
-consultas de ledger/transações, reconciliação e validação com múltiplos processos
-ainda estão pendentes. Os eventos da outbox são armazenados, mas ainda não publicados.
-A API atual não possui autenticação.
+Ainda faltam consultas de ledger/transações, reconciliação, health checks,
+observabilidade completa e validação com processos independentes e interrupções
+reais. A API não possui autenticação nem seu ponto de extensão. A entrega de
+eventos pode se repetir; consumidores devem deduplicar pelo eventId.
 
 ## Executar localmente
 
-Requisitos: **Bun 1.x** e **Docker com Compose**. Na raiz do projeto, no PowerShell:
+Requisitos: **Bun 1.x e Docker com Compose**. Na raiz, no PowerShell:
 
 ```powershell
 bun install --frozen-lockfile
 if (!(Test-Path .env)) { Copy-Item .env.example .env }
-docker compose up -d
+docker compose up -d --wait
 bun run db:migration:up
+bun run queues:setup
+$env:MESSAGING_ENABLED = "true"
 bun run start
 ```
 
-Confira as variáveis do `.env` antes da execução. Por padrão, a API atende em
-`http://localhost:3000`.
+Confira o `.env`. A API usa `http://localhost:3000`; SQS local usa
+`http://127.0.0.1:4566`, região `us-east-1` e credenciais locais `test/test`.
+O comando acima habilita consumidor e publicador nesse terminal. Sem
+`MESSAGING_ENABLED=true`, a API funciona, mas a outbox acumula eventos sem publicar.
+O worker de referências inicia por padrão; `REFERENCE_WORKER_ENABLED=false` o desativa.
+
+Filas: `wager-transactions.fifo` (entrada), `wager-transactions-dlq.fifo` (falhas)
+e `wager-events.fifo` (eventos). O guia explica configuração e envelopes.
 
 | Método | Rota | Finalidade |
 | --- | --- | --- |
 | POST | /wallets | Abrir carteira |
 | GET | /wallets/:walletId | Consultar carteira |
-| POST | /wagering/transactions | Processar apostas, resultados e reversões |
+| POST | /wagering/transactions | Processar operações |
 
-Exemplo de corpo para criação:
+Exemplo de abertura:
 
 ```json
 {
@@ -61,40 +61,35 @@ Exemplo de corpo para criação:
 }
 ```
 
-A submissão de operações exige o header `Idempotency-Key`. Uma operação finalizada,
-quando reenviada sem alterações,
-retorna o resultado original com `idempotentReplay: true`; conteúdo diferente com
-a mesma chave gera 409. Rejeições financeiras retornam 422; operações aguardando
-referência retornam 202. O worker tenta novamente com intervalos crescentes até
-o TTL de 15 minutos. Ele inicia com a API; `REFERENCE_WORKER_ENABLED=false` o desativa.
+Operações HTTP exigem `Idempotency-Key`. Reenviar uma operação finalizada sem
+alterações recupera seu resultado histórico com `idempotentReplay: true`, sem
+nova movimentação. Conflitos retornam 409, rejeições financeiras 422 e espera
+por referência 202.
 
 ## Validar
+
+Defina `POSTGRES_TEST_DB=wagering_test` no `.env` e mantenha os containers ativos:
 
 ```powershell
 bun run build
 bun run lint
 bun run test:unit
-```
-
-Para os testes HTTP e de integração, defina `POSTGRES_TEST_DB=wagering_test` no
-`.env`, mantenha o PostgreSQL em execução e rode:
-
-```powershell
 bun run db:test:prepare
 bun run test:e2e
+bun run test:messaging
 ```
 
-**Use um banco separado terminado em `_test`: a suíte reverte e reaplica as
-migrations, removendo os dados desse banco de testes.**
+**Use banco exclusivo terminado em `_test`: a suíte HTTP/SQL reverte migrations
+e remove os dados desse banco. Rode as suítes em sequência.** A suíte SQS utiliza
+filas próprias e as remove no encerramento. Não execute workers externos nesse banco.
 
-Validação realizada: **108 testes unitários e 44 testes HTTP/SQL aprovados**, com
-PostgreSQL 17 em Docker, além de build e lint sem erros.
+Validação: **115 testes unitários, 55 HTTP/SQL e seis com PostgreSQL e LocalStack
+reais aprovados**, além de build e lint. Os testes atuais ainda não comprovam
+três processos independentes ou interrupção real por kill.
 
-As decisões, justificativas e limitações estão em
-[ARCHITECTURE.md](ARCHITECTURE.md). O passo a passo da abertura e dos comandos
-está em [GUIA-ABERTURA.md](GUIA-ABERTURA.md); o processamento externo é explicado
-em [GUIA-TRANSACOES.md](GUIA-TRANSACOES.md). Referências e reprocessamento estão
-em [GUIA-REFERENCIAS.md](GUIA-REFERENCIAS.md).
+## Guias
 
-Desafio de referência: [Jungle Gaming — Backend
-Challenge](https://github.com/junglegaming/backend-challenge).
+[Abertura](GUIA-ABERTURA.md) · [Transações](GUIA-TRANSACOES.md) ·
+[Referências](GUIA-REFERENCIAS.md) · [Mensageria](GUIA-MENSAGERIA.md).
+
+Desafio: [Jungle Gaming — Backend Challenge](https://github.com/junglegaming/backend-challenge).

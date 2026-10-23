@@ -1,5 +1,7 @@
 # Decisões de arquitetura
 
+Revisado em 23/10/2026, com as decisões de mensageria adotadas em 22/10/2026.
+
 Este documento registra as decisões já adotadas no Distributed Wagering Processor,
 suas justificativas, trade-offs e limitações. A referência é o
 [enunciado do desafio](https://github.com/junglegaming/backend-challenge).
@@ -18,6 +20,8 @@ reconstruir objetos persistidos sem repetir operações de negócio.
 Essa separação permite testar as regras sem infraestrutura. O custo é manter os
 mapeamentos e as conversões. Neste estágio, o serviço de aplicação usa MikroORM
 diretamente; ainda não há interfaces de repositório separando essa dependência.
+Na mensageria, QueuePort separa as operações de fila do adaptador SqsTransport.
+Essa porta já existe; não representa uma abstração dos repositórios financeiros.
 
 Um fork do EntityManager por execução isola os objetos acompanhados pela Unit of
 Work. Ele não substitui transações SQL nem resolve a disputa pelo saldo entre
@@ -91,6 +95,7 @@ mudanças de saldo, não um mecanismo de optimistic locking. LOSS, rejeição e 
 não a incrementam. Não há retry automático implementado para falhas de bloqueio.
 
 Transação externa, atualização da carteira, ledger e outbox também são atômicos.
+Quando a entrada é SQS, a confirmação da inbox integra esse mesmo commit.
 O primeiro flush grava o estado da transação, permitindo que o
 trigger do ledger encontre seu estado. O segundo envia as demais gravações.
 Ambos ocorrem antes do commit: uma falha posterior reverte inclusive o primeiro
@@ -126,7 +131,8 @@ substituem as regras completas de processamento de apostas e reversões.
 Preservei a primeira migration e acrescentei uma segunda para converter o ID da
 carteira de texto para UUID e criar as demais tabelas. Uma terceira migration cria
 reference_schedules, o índice único parcial de
-reversões e a validação SQL da referência processada. As três possuem up() e down().
+reversões e a validação SQL da referência processada. A quarta acrescenta a inbox,
+sua chave composta e a imutabilidade das confirmações. Todas possuem up() e down().
 A aplicação não sincroniza automaticamente o schema na inicialização.
 
 O índice único (reference_transaction_id, kind), limitado a REFUND e ROLLBACK
@@ -219,7 +225,7 @@ O worker roda dentro da aplicação Nest. REFERENCE_WORKER_ENABLED=false o desat
 por padrão está habilitado. Um controle local evita sobrepor suas próprias
 varreduras, enquanto os locks SQL protegem execuções de instâncias distintas.
 Os hooks de desligamento interrompem novas varreduras e aguardam a ativa.
-Isso ainda não implementa encerramento ou devolução de visibilidade de mensagens SQS.
+Esse worker possui ciclo de vida separado dos workers SQS descritos na seção 7.
 
 ## 6. Resultado histórico e identidade da operação
 
@@ -267,32 +273,124 @@ colisões de chave entre carteiras distintas, as restrições UNIQUE decidem a
 vencedora. A execução perdedora sofre rollback e consulta o registro confirmado
 com outro EntityManager, pois a transação abortada não pode ser reutilizada.
 
-## 7. Eventos e outbox
+## 7. Mensageria, inbox e publicação da outbox
 
-Decidi persistir WagerTransactionProcessed e WalletBalanceChanged junto da abertura
-positiva. Cada um possui uma classe concreta com eventType e versão `1`, baseada
-em IntegrationEvent. O envelope contém eventId, aggregateId, correlationId,
-causationId, occurredAt e data.
+### Transporte e filas
 
-No processamento externo, BET, WIN e reversões processadas geram
-WagerTransactionProcessed e
-WalletBalanceChanged; LOSS gera somente WagerTransactionProcessed. Rejeições
-geram WagerTransactionRejected, incluindo um failureCode estável. Replay não cria
-novos eventos nem lançamentos. A entrada em espera gera
-WagerTransactionPendingReference; sua expiração gera WagerTransactionRejected.
-Os eventos de espera e conclusão compartilham a correlação preservada no
-agendamento, com IDs próprios e causationId da transação.
+Adotei AWS SDK v3 para SQS via LocalStack no Docker Compose. QueuePort define as
+operações utilizadas pelos workers; SqsTransport adapta o SDK. A separação permite
+controlar falhas nos testes sem substituir a validação contra broker real.
+LocalStack está fixado em 4.0.3; a porta 4566 fica limitada ao host local. Não há
+garantia implementada de persistência das filas após recriar o container local.
 
-A serialização usa datas ISO e MoneyProps, sem instâncias de Money. Cópias dos
-dados isolam o envelope dos objetos externos. A versão do evento identifica seu
-contrato; é independente da versão financeira da carteira.
+O script queues:setup cria wager-transactions.fifo, wager-transactions-dlq.fifo e
+wager-events.fifo. A terceira recebe os eventos publicados. Configurei redrive da
+entrada para a DLQ após cinco recebimentos. FIFO ajuda na ordenação por carteira,
+mas o banco continua responsável por idempotência e correção financeira.
 
-OutboxRecord guarda o envelope em JSONB, com tentativas em zero e publishedAt nulo.
-A decisão preserva a intenção de publicação no mesmo commit dos dados financeiros.
-Em contrapartida, a comunicação com outros serviços não ocorre imediatamente.
+Consumidor e publicador só iniciam com MESSAGING_ENABLED=true. Sem isso, a API pode
+processar e acumular outbox. Separar essa configuração facilita testes e execução
+local; não significa readiness, que ainda não foi implementada.
 
-Ainda não existe publisher SQS, coordenação entre publishers ou recuperação de
-publicações. Persistir eventos pendentes não comprova entrega distribuída.
+### Inbox e confirmação após o commit
+
+A mensagem contém messageId, type, occurredAt e data, incluindo idempotencyKey.
+O parser valida o envelope e reutiliza o DTO HTTP. O consumidor chama o mesmo
+ProcessTransactionService, fornecendo contexto opcional de inbox. Não existe uma
+segunda implementação das regras financeiras para SQS.
+
+A chave da inbox é (consumerName, messageId do envelope). O consumidor atual se
+chama wager-transactions-v1. O ID do broker é usado no diagnóstico e no envio à
+DLQ; o ReceiptHandle da entrega atual é usado para ack e visibilidade.
+
+InboxMessage encapsula recebimento e confirmação; InboxRecord persiste identidade,
+datas, hash e resultado em JSONB. O hash é SHA-256 do JSON [payloadHash,
+idempotencyKey], para detectar também mudança da chave no mesmo messageId.
+Uma confirmação existente com conteúdo diferente gera conflito. A chave primária
+composta e um trigger de imutabilidade reforçam a proteção no PostgreSQL.
+
+A inbox é confirmada na mesma transação SQL de saldo, transação, ledger e outbox.
+Até um replay de operação criada por HTTP pode confirmar uma nova inbox sem
+repetir a movimentação. Falhar na inbox após flushes financeiros reverte tudo.
+Somente após execute() concluir o commit o consumidor executa DeleteMessage.
+
+Se ocorrer redelivery depois do commit e antes do ack, a inbox devolve o resultado
+registrado sem outro efeito financeiro. IDs de mensagem diferentes continuam
+sujeitos à idempotência da operação. Para PENDING_REFERENCE, o aceite e o
+agendamento são persistidos antes do ack; o worker de referências assume a
+continuidade. A inbox conserva o resultado de seu recebimento, não consulta o
+saldo atual para reconstruí-lo.
+
+### Visibilidade, retry e DLQ
+
+Cada instância recebe uma mensagem por vez, com long polling de até 10 segundos.
+A visibilidade começa em 30 segundos e é renovada a cada 10 enquanto processa.
+Isso reduz redelivery durante operações lentas, mas não substitui locks e inbox.
+O custo é limitar o paralelismo por instância; outras instâncias podem avançar
+sobre carteiras distintas. Produtores devem usar walletId como MessageGroupId.
+
+Rejeições financeiras recebem ack, pois já são resultados auditáveis no banco.
+Mensagens inválidas, carteira inexistente e conflitos permanentes são enviados à
+DLQ com corpo original e atributos de motivo/origem. A origem só é confirmada
+após o envio. Não há atomicidade entre esse envio e a remoção: a DLQ também pode
+receber repetições se houver falha nessa janela.
+
+Outras falhas usam ChangeMessageVisibility com intervalos de 5, 10, 20 e 40
+segundos. No quinto recebimento sem processamento confirmado, o consumidor envia
+à DLQ. A contagem vem de ApproximateReceiveCount, não de memória da aplicação.
+O cálculo limita intervalos a 300 segundos para contagens maiores, e o redrive
+do broker oferece proteção quando a instância falha antes do encaminhamento.
+
+Falha apenas no ack após commit mantém a inbox confirmada e permite redelivery
+seguro; não transforma o resultado financeiro em uma nova falha. Mensagens na
+DLQ são preservadas, mas ainda não há retomada administrativa nem criação
+automática de WagerTransaction FAILED para toda falha permanente de infraestrutura.
+
+### Eventos e publicador concorrente
+
+Os eventos concretos herdam IntegrationEvent, têm eventType e versão 1. O envelope
+contém eventId, aggregateId, correlationId, causationId, occurredAt e data. Datas
+são ISO e dinheiro usa MoneyProps, sem instâncias de Money. Cópias defensivas
+isolam os dados. A versão do evento é independente da versão da carteira.
+
+Abertura positiva, BET, WIN e reversões processadas geram WagerTransactionProcessed
+e WalletBalanceChanged. LOSS gera somente WagerTransactionProcessed. Rejeições
+geram WagerTransactionRejected. A entrada em espera gera
+WagerTransactionPendingReference; sua expiração gera rejeição. Replay não cria
+novos eventos nem lançamentos.
+
+OutboxRecord persiste o envelope no commit financeiro. OutboxPublisherWorker lê
+apenas eventos confirmados e devidos e bloqueia uma linha por transação com
+FOR UPDATE SKIP LOCKED. Assim, outro publicador seleciona outro evento. A chamada
+SQS ocorre nessa transação separada da outbox, sem lock financeiro da carteira.
+Mantê-la durante o envio simplifica a posse do trabalho, ao custo de ocupar uma
+conexão e um lock durante a rede; o cliente usa prazos de conexão/requisição.
+
+Após o envio, marca publishedAt. Em falha, OutboxMessage incrementa attempts e
+persiste nextAttemptAt com backoff de 5 segundos até 300. Não há descarte por
+limite de tentativas: um evento financeiro confirmado permanece recuperável.
+A varredura ocorre a cada segundo, com até dez itens por rodada.
+
+Se o SQS aceitar e a marcação SQL falhar, pode haver outra publicação. O mesmo
+eventId é usado como MessageDeduplicationId. A deduplicação FIFO possui janela
+limitada; consumidores dos eventos precisam deduplicar persistentemente pelo
+eventId. Ainda não existe consumidor de negócio da fila de eventos no projeto.
+Publicadores concorrentes não garantem ordem global de publicação. A garantia
+adotada é entrega com possíveis repetições, não exactly-once entre banco e broker.
+
+### Encerramento e diagnóstico
+
+Consumidor e publicador interrompem novas buscas e aguardam trabalho ativo antes
+de fechar dependências. O long polling é cancelado; uma entrega recebida durante
+a parada pode ter visibilidade devolvida, enquanto uma já em processamento pode
+concluir commit e ack. Os hooks estão habilitados no Nest. Essa proteção não
+impede interrupção forçada; nesse caso a recuperação depende de banco e broker.
+
+Os logs dos workers são JSON com IDs disponíveis de correlação, mensagem,
+transação, carteira e provedor, sem corpos financeiros completos. Quando não há
+correlação válida no envelope, ela é derivada de forma estável do messageId.
+Esses logs não constituem observabilidade completa: logs globais da API, métricas
+e health checks permanecem pendentes.
 
 ## 8. Contratos HTTP e classificação dos resultados
 
@@ -340,31 +438,37 @@ pendentes; verificar o playerId não comprova a identidade de quem chama a API.
 
 ## 9. Validação e limites conhecidos
 
-Build e lint passaram sem avisos. Foram aprovados 108 testes unitários e 44
-testes HTTP/SQL no ambiente local com PostgreSQL 17 em Docker.
+Build e lint passaram. A suíte possui 115 testes unitários aprovados. No ambiente
+local com containers, passaram 55 testes HTTP/SQL com PostgreSQL 17 e seis testes
+de mensageria com PostgreSQL e LocalStack reais.
 
-A suíte integrada verifica up/down das migrations, abertura positiva e zero,
-versão inicial, duplicidade, precisão monetária, consulta e restrições SQL.
-No processamento, cobre BET, WIN, LOSS, replay histórico, conflitos e rejeições,
-além de rollback quando a outbox falha após o primeiro flush. A ampliação cobre
-reversões, referências incompatíveis, WIN referenciado, chegada fora de ordem,
-backoff e expiração. Também verifica chamadas concorrentes de reprocessamento,
-restrição SQL de reversões, retomada por outro objeto de worker e rollback da
-expiração se a outbox falhar. Os testes usam horários explícitos e desativam o
-timer automático para não depender de sleeps ou esperar 15 minutos.
+Os testes cobrem migrations reversíveis, constraints, abertura e versão inicial,
+precisão monetária, operações, referências, replay e rollback. No reprocessamento,
+verificam backoff, expiração e falha da outbox; o relógio explícito evita esperar
+o TTL nos testes.
 
-Os cenários concorrentes executados incluem duas apostas de 80.00 disputando
-100.00, cinquenta pedidos simultâneos da mesma operação e uma chave disputada
-entre carteiras. Confirmam um único débito quando aplicável. São requisições
-concorrentes à mesma aplicação de teste; ainda não comprovam o cenário exigido
-com três ou mais processos independentes.
+A suíte HTTP/SQL usa transporte controlado para provocar falhas de ack, inbox,
+outbox e publicação. Verifica rollback de todas as gravações se a inbox falhar,
+seleção concorrente de publishers, repetição do mesmo eventId após falha na
+marcação e desligamento aguardando confirmação ativa.
 
-O banco indicado por POSTGRES_TEST_DB é separado e deve terminar em _test,
-pois a suíte reverte e reaplica migrations nele. Não há sincronização automática
-do schema na inicialização.
+A suíte real SQS verifica redelivery físico com mesmo messageId, janela commit/ack
+retomada por outro consumidor, mensagem inválida em DLQ, ack de rejeição de saldo,
+retry até DLQ e dois publishers enviando eventos. Esses cenários passaram em
+22/10/2026. A janela de falha é simulada; não foi provocada matando um processo.
 
-Inbox, publicação/consumo SQS, coordenação entre publishers, recuperação após
-interrupção real de processos, consultas de ledger/transações, reconciliação,
-health checks e observabilidade operacional completa ainda estão pendentes.
-Recriar um objeto de worker não comprova recuperação após matar um processo. Não há
-alegação de atendimento integral do desafio.
+Os cenários de saldo incluem duas apostas de 80.00 disputando 100.00, cinquenta
+pedidos da mesma operação e colisão de chave entre carteiras. São chamadas
+concorrentes e objetos de worker na mesma execução de teste. Ainda faltam três
+processos independentes, kill real após commit antes de ack e recuperação após
+interrupção real de publicador/serviço. Não apresento recriação de objeto como
+prova de reinício de processo.
+
+POSTGRES_TEST_DB deve apontar para banco exclusivo terminado em _test. A suíte
+HTTP/SQL reverte e reaplica migrations nele. A suíte SQS cria filas com nomes
+únicos e as remove ao finalizar. As suítes que compartilham esse banco devem
+rodar em sequência, sem workers externos usando o banco de testes.
+
+Consultas de ledger/transações, reconciliação, health checks, métricas, logs globais,
+autenticação/ponto de extensão e classificação operacional completa de FAILED
+continuam pendentes. Não há alegação de atendimento integral do desafio.
